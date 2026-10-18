@@ -13437,16 +13437,54 @@ Ext.Mod = {}
 -- dependencies hundreds of times as the menu comes up.
 local mods_by_addr = {}
 
+-- Upstream pushes a Version by value, so each read of ModVersion is a new
+-- table; mods table.remove() the build number from theirs.
+local function by_value_versions(t)
+  local versions = {ModVersion = t.ModVersion, PublishVersion = t.PublishVersion}
+  t.ModVersion, t.PublishVersion = nil, nil
+  return setmetatable(t, {
+    __index = function(_, key)
+      local v = versions[key]
+      if type(v) ~= "table" then return v end
+      return {table.unpack(v)}
+    end,
+    __newindex = function(_, key, value)
+      if key == "ModVersion" or key == "PublishVersion" then
+        versions[key] = value
+      else
+        rawset(t, key, value)
+      end
+    end,
+    __pairs = function(self)
+      local raw = true
+      return function(_, key)
+        if raw then
+          local k, v = next(t, key)
+          if k ~= nil then return k, v end
+          raw, key = false, nil
+        end
+        local k = next(versions, key)
+        if k ~= nil then return k, self[k] end
+      end, self, nil
+    end,
+  })
+end
+
 local function make_mod(addr)
   local known = mods_by_addr[addr]
   if known ~= nil then return known end
   local info = Ext._Internal.ModInfo(addr)
   if info == nil then return nil end
+  local function descs(which)
+    local list = Ext._Internal.ModList(addr, which)
+    for _, desc in ipairs(list) do by_value_versions(desc) end
+    return list
+  end
   local mod = {
-    Info = info,
-    Dependencies = Ext._Internal.ModList(addr, 0),
-    ModConflicts = Ext._Internal.ModList(addr, 1),
-    Addons = Ext._Internal.ModList(addr, 2),
+    Info = by_value_versions(info),
+    Dependencies = descs(0),
+    ModConflicts = descs(1),
+    Addons = descs(2),
   }
   mods_by_addr[addr] = mod
   return mod
@@ -13553,25 +13591,6 @@ function Ext.Mod.IsModLoaded(uuid)
   return mod_loaded[uuid] == true
 end
 
--- What the archives say about a mod the engine has not loaded, keyed by
--- UUID. Built once, from each mod's own meta.lsx -- the same file the
--- engine reads -- so a mod that is installed and enabled can still be
--- described.
--- Larian packs a version into one 64-bit number, and bg3se's Version
--- spells out where each part sits: major above bit 55, minor in the eight
--- bits below that, revision in sixteen more, build in the low
--- thirty-one.
---
--- Worth doing rather than reporting zeros. Mod Configuration Menu prints
--- its own version from this, and with {0,0,0,0} it announced itself as
--- "version 0.0.0" on both sides.
-local function decode_version(packed)
-  local v = math.tointeger(tonumber(packed or 0) or 0)
-  if v == nil or v == 0 then return {0, 0, 0, 0} end
-  return {(v >> 55) & 0x1ff, (v >> 47) & 0xff, (v >> 31) & 0xffff,
-          v & 0x7fffffff}
-end
-
 -- Every mod the engine has a Module for, by uuid, whether or not it made
 -- the load order.
 --
@@ -13608,13 +13627,32 @@ end
 
 local installed_mods = nil
 
+-- What the archives say about a mod the engine has not loaded, keyed by
+-- UUID. Built once, from each mod's own meta.lsx -- the same file the
+-- engine reads -- so a mod that is installed and enabled can still be
+-- described.
 local function installed_mod(uuid)
+  -- Larian packs a version into one 64-bit number, and bg3se's Version
+  -- spells out where each part sits: major above bit 55, minor in the eight
+  -- bits below that, revision in sixteen more, build in the low
+  -- thirty-one.
+  --
+  -- Worth doing rather than reporting zeros. Mod Configuration Menu prints
+  -- its own version from this, and with {0,0,0,0} it announced itself as
+  -- "version 0.0.0" on both sides.
+  local function decode_version(packed)
+    local v = math.tointeger(tonumber(packed or 0) or 0)
+    if v == nil or v == 0 then return {0, 0, 0, 0} end
+    return {(v >> 55) & 0x1ff, (v >> 47) & 0xff, (v >> 31) & 0xffff,
+            v & 0x7fffffff}
+  end
+
   if installed_mods == nil then
     installed_mods = {}
     for _, module in ipairs(Ext._Internal.PakModules()) do
       if module.Uuid ~= nil and module.Uuid ~= "" then
         installed_mods[module.Uuid] = {
-          Info = {
+          Info = by_value_versions({
             ModuleUUIDString = module.Uuid,
             Name = module.ModName,
             Directory = module.Name,
@@ -13631,7 +13669,7 @@ local function installed_mod(uuid)
             NumPlayers = 0,
             FileSize = 0,
             PublishHandle = 0,
-          },
+          }),
           Dependencies = {},
           ModConflicts = {},
           Addons = {},
