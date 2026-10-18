@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.13 (2026-10-17)
+
+- `Ext.Entity.GetEntitiesAroundPosition` reads the engine's spatial grid, as upstream does, so it returns only the
+  world's characters and items, measured across the ground, and honours `includeCharacters` and `includeItems`.
+  bg3le returned every entity with a position in range, scenery and effects included, so code reading each result's
+  UUID failed on the ones that have none.
+- Key events with more than one modifier reach `KeyInput` handlers again, with `Modifiers` as an `SDLKeyModifier`
+  bitfield, as upstream has it. Since v0.3.11 a key pressed with Shift, Ctrl or Alt while Num Lock was on failed
+  with "attempt to compare two SDLKeyModifier values" before any handler ran.
+
 ## v0.3.12 (2026-10-17)
 
 - A mod's `Info.ModVersion` and `PublishVersion` are a new table on every read, as upstream's are. bg3le handed
