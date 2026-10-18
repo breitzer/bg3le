@@ -11482,17 +11482,9 @@ local function input_label(enum, value)
   return labels ~= nil and labels[value] or value
 end
 
+-- A bitmask enum field, which upstream pushes as a BitfieldValue.
 local function input_flags(enum, value)
-  local out = {}
-  local labels = Ext.Enums[enum]
-  if labels == nil then return out end
-  for k, label in pairs(labels) do
-    if type(k) == "number" and k ~= 0 and value & k == k then
-      out[#out + 1] = label
-    end
-  end
-  table.sort(out)
-  return out
+  return Ext._Internal.BitfieldValue(enum, value)
 end
 
 function Ext._Internal.InputEvent(kind, a, b, c, d, e, x, y)
