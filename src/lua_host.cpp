@@ -14608,6 +14608,11 @@ local function read_object_path(addr, class, path, kind)
     return snapshot_container(items, "array", write, function(values)
       assign(values)
       read_items(items)
+      for i, item in ipairs(values) do
+        if type(item) == "table" and Ext._Internal.Walkable(items[i]) then
+          Ext.Types.Unserialize(items[i], item)
+        end
+      end
     end)
   end
 
@@ -14768,6 +14773,9 @@ function read_object(addr, class, prefix, out)
       -- shows what the engine now holds.
       values[key] = read_object_path(addr, class, path, kind)
       read[key] = true
+      if type(value) == "table" and value[1] ~= nil then
+        Ext._Internal.FillStructElements(values[key], value)
+      end
     end,
     __pairs = function(self)
       local key
