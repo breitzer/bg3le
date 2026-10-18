@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.3.12 (2026-10-17)
+
+- A mod's `Info.ModVersion` and `PublishVersion` are a new table on every read, as upstream's are. bg3le handed
+  every caller the same table, so a mod that removed the build number from its copy left three parts for everyone
+  else, and code formatting the version as four numbers failed. Dependency, conflict and addon entries get the same.
+- Assigning a list of tables to an array on a resource object fills in each element, as upstream does. bg3le
+  resized the array but left every struct element empty and still reported success: a `CharacterVisual`'s
+  `VisualSet.Slots` lost each slot's name, bone and visual, and the model drew without its head.
+
 ## v0.3.11 (2026-10-14)
 
 - `Ext.Timer` runs on the game's own clock, as upstream does: the `GameTime` the engine hands each side's update.
