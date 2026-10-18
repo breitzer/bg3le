@@ -16193,31 +16193,42 @@ function Ext.Entity.GetAllEntitiesWithUuid()
   end
   return out
 end
--- Entities within a radius of a point.
---
--- Upstream asks the engine's spatial index; bg3le has not located it, so
--- this walks the entities that carry a transform and measures. The answer
--- is the same set -- the index is an acceleration structure, not a
--- different definition -- and at around five thousand transforms it is
--- fast enough to call, but it is linear where upstream's is not, so a
--- caller doing it every frame should know.
-function Ext.Entity.GetEntitiesAroundPosition(position, radius)
+-- Characters and items within a radius of a point, from the engine's
+-- spatial grid: upstream's GridStructure::Collect, which measures in x/z
+-- and includes both kinds unless told otherwise.
+function Ext.Entity.GetEntitiesAroundPosition(position, radius, includeCharacters, includeItems)
   if type(position) ~= "table" or type(radius) ~= "number" then
     error("Ext.Entity.GetEntitiesAroundPosition(position, radius)", 2)
   end
+  local holder = Ext.Entity.GetAllEntitiesWithComponent("SpatialGrid")[1]
+  local data = holder ~= nil and holder.SpatialGrid or nil
+  if data == nil then return {} end
+
+  local grid = data.Grid
+  local cellSize = 12.727922
+  local function clamp(px, pz)
+    local x = math.tointeger(math.modf((px - grid.MinPos[1]) / cellSize)) or 0
+    local z = math.tointeger(math.modf((pz - grid.MinPos[3]) / cellSize)) or 0
+    return math.min(math.max(x, 0), grid.Size), math.min(math.max(z, 0), grid.Size)
+  end
+  local x0, z0 = clamp(position[1] - radius, position[3] - radius)
+  local x1, z1 = clamp(position[1] + radius, position[3] + radius)
 
   local out = {}
-  local limit = radius * radius
-  for _, entity in ipairs(Ext.Entity.GetAllEntitiesWithComponent("Transform")) do
-    local transform = entity ~= nil and entity.Transform or nil
-    local at = transform ~= nil and transform.Transform or nil
-    local translate = at ~= nil and at.Translate or nil
-    if translate ~= nil then
-      local dx = translate[1] - position[1]
-      local dy = translate[2] - position[2]
-      local dz = translate[3] - position[3]
-      if dx * dx + dy * dy + dz * dz <= limit then
-        out[#out + 1] = entity
+  local function take(records)
+    for _, record in ipairs(records) do
+      local dx = record.Position[1] - position[1]
+      local dz = record.Position[3] - position[3]
+      if math.sqrt(dx * dx + dz * dz) < radius then out[#out + 1] = record.Entity end
+    end
+  end
+  local cells = grid.Cells
+  for z = z0, z1 do
+    for x = x0, x1 do
+      local cell = cells[z + grid.Size * x]
+      if cell ~= nil then
+        if includeCharacters ~= false then take(cell.Characters) end
+        if includeItems ~= false then take(cell.Items) end
       end
     end
   end
