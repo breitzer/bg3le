@@ -85,6 +85,44 @@ bool take_injected(SDL_Event* event) {
 
 using bg3le::InputKind;
 
+// The desktop the game sized its window against.
+void log_displays(SDL_Window* window) {
+    using Count = int (*)(void);
+    using Mode = int (*)(int, SDL_DisplayMode*);
+    using Index = int (*)(SDL_Window*);
+    static const Count count = real<Count>("SDL_GetNumVideoDisplays");
+    static const Mode desktop = real<Mode>("SDL_GetDesktopDisplayMode");
+    static const Index index = real<Index>("SDL_GetWindowDisplayIndex");
+    if (count == nullptr || desktop == nullptr || index == nullptr) return;
+    const int n = count();
+    for (int i = 0; i < n; ++i) {
+        SDL_DisplayMode mode{};
+        if (desktop(i, &mode) != 0) continue;
+        bg3le::logf("sdl: display %d is %dx%d at %d Hz%s", i, mode.w, mode.h, mode.refresh_rate,
+                    i == index(window) ? ", the window's" : "");
+    }
+}
+
+// Size and display changes, which come before a swapchain rebuild.
+void log_window_event(SDL_WindowEvent const& e) {
+    static std::atomic<unsigned> seen{0};
+    switch (e.event) {
+    case SDL_WINDOWEVENT_RESIZED:
+    case SDL_WINDOWEVENT_SIZE_CHANGED:
+    case SDL_WINDOWEVENT_MINIMIZED:
+    case SDL_WINDOWEVENT_MAXIMIZED:
+    case SDL_WINDOWEVENT_RESTORED:
+    case SDL_WINDOWEVENT_DISPLAY_CHANGED:
+        break;
+    default:
+        return;
+    }
+    const unsigned n = ++seen;
+    if (n <= 40 || (n & (n - 1)) == 0) {
+        bg3le::logf("sdl: window event %d, %d %d (%u so far)", (int)e.event, e.data1, e.data2, n);
+    }
+}
+
 // KeyInput and friends; true if a handler prevented a cancelable event.
 bool dispatch_input(SDL_Event const* e) {
     switch (e->type) {
@@ -116,6 +154,7 @@ bool dispatch_input(SDL_Event const* e) {
             e->type == SDL_CONTROLLERBUTTONDOWN, e->cbutton.button,
             e->cbutton.state == SDL_PRESSED, 0, 0, 0);
     case SDL_WINDOWEVENT:
+        log_window_event(e->window);
         if (e->window.event == SDL_WINDOWEVENT_RESIZED) {
             bg3le::lua_client_input(InputKind::ViewportResized,
                                     e->window.data1, e->window.data2, 0, 0,
@@ -138,7 +177,9 @@ extern "C" SDL_Window* SDL_CreateWindow(char const* title, int x, int y,
     SDL_Window* window = next(title, x, y, w, h, flags);
 
     if (window != nullptr && bg3le::imgui_overlay_wanted()) {
-        bg3le::logf("sdl: window %p, %dx%d", (void*)window, w, h);
+        bg3le::logf("sdl: window %p, %dx%d at %d,%d, flags %#x", (void*)window, w, h, x, y,
+                    (unsigned)flags);
+        log_displays(window);
         bg3le::sdl_on_create_window(window);
     }
     return window;

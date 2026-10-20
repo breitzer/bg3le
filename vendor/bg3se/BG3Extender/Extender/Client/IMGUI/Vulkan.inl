@@ -21,6 +21,9 @@ void hdr_record(VkCommandBuffer cmd, std::uint32_t index, ImDrawData* draw);
 bool vk_image_view_live(VkImageView view);
 std::size_t vk_image_views_tracked();
 char const* vk_image_view_state(VkImageView view);
+// src/log.cpp and src/vendor/imgui_overlay.cpp.
+char const* thread_tag();
+std::mutex& imgui_frame_mutex();
 }
 
 BEGIN_SE()
@@ -172,7 +175,8 @@ public:
         init_info.RenderPass = bg3le::hdr_overlay_pass() != VK_NULL_HANDLE
             ? bg3le::hdr_overlay_pass() : swapchain_.renderPass_;
         ImGui_ImplVulkan_Init(&init_info);
-        ImGui_ImplVulkan_CreateFontsTexture();
+        // bg3le: uploaded by the present hook, see uploadFonts.
+        fontUploadPending_ = true;
 
         initialized_ = true;
 
@@ -213,13 +217,18 @@ public:
         curViewport_ = (curViewport_ + 1) % viewports_.size();
         GImGui->Viewports[0] = &viewports_[curViewport_].Viewport;
 
-        if (requestReloadFonts_) {
-            IMGUI_DEBUG("Rebuilding font atlas");
-            ImGui_ImplVulkan_DestroyFontsTexture();
+        // bg3le: the atlas is built here and uploaded from the present hook; the
+        // upload uses the game's queue, which this thread must not touch.
+        auto& io = ImGui::GetIO();
+        if (requestReloadFonts_ || !io.Fonts->IsBuilt()) {
+            IMGUI_DEBUG("Rebuilding font atlas (%s)", bg3le::thread_tag());
+            unsigned char* pixels;
+            int width, height;
+            io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
             requestReloadFonts_ = false;
+            fontUploadPending_ = true;
         }
-
-        ImGui_ImplVulkan_NewFrame();
+        viewports_[curViewport_].FontGeneration = fontGeneration_;
         IMGUI_FRAME_DEBUG("VK: NewFrame");
     }
 
@@ -384,6 +393,8 @@ private:
     {
         ImGuiViewportP Viewport;
         Array<ImDrawList*> ClonedDrawLists;
+        // bg3le: the font texture this frame was built against.
+        uint32_t FontGeneration{ 0 };
     };
 
     void vkCreateInstanceHooked(
@@ -506,6 +517,7 @@ private:
         std::lock_guard _(globalResourceLock_);
         IMGUI_DEBUG("VK device destroyed");
 
+        waitForOverlay();
         DestroyUI();
         releaseSwapChain(swapchain_);
 
@@ -550,7 +562,7 @@ private:
         if (result != VK_SUCCESS || device != device_) return;
 
         std::lock_guard _(globalResourceLock_);
-        IMGUI_DEBUG("VK swap chain created: %p", *pSwapchain);
+        IMGUI_DEBUG("VK swap chain created: %p (%s)", *pSwapchain, bg3le::thread_tag());
         swapChain_ = *pSwapchain;
         collectSwapChainInfo(pCreateInfo);
     }
@@ -563,12 +575,42 @@ private:
         if (device != device_ || swapchain != swapChain_) return;
 
         std::lock_guard _(globalResourceLock_);
-        IMGUI_DEBUG("VK swap chain destroyed");
+        IMGUI_DEBUG("VK swap chain destroyed (%s)", bg3le::thread_tag());
+        waitForOverlay();
         DestroyUI();
         releaseSwapChain(swapchain_);
 
         swapChain_ = VK_NULL_HANDLE;
         pipelineCache_ = VK_NULL_HANDLE;
+    }
+
+    // bg3le: teardown frees what the overlay's last submissions use; wait for them.
+    void waitForOverlay()
+    {
+        Array<VkFence> fences;
+        for (auto const& image : swapchain_.images_) {
+            if (image.fence != VK_NULL_HANDLE) fences.push_back(image.fence);
+        }
+        if (fences.size() == 0) return;
+
+        auto result = vkWaitForFences(device_, (uint32_t)fences.size(), fences.data(), VK_TRUE, 1000000000ull);
+        if (result != VK_SUCCESS) {
+            ERR("Overlay submissions still running at teardown (%d)", result);
+        }
+    }
+
+    // bg3le: the font texture goes up on the game's present thread, and only while
+    // no frame is being built, since a frame reads the atlas and its texture id.
+    void uploadFonts()
+    {
+        auto& frame = bg3le::imgui_frame_mutex();
+        if (!frame.try_lock()) return;
+        std::lock_guard held(frame, std::adopt_lock);
+
+        IMGUI_DEBUG("Uploading the font atlas (%s)", bg3le::thread_tag());
+        fontsBroken_ = !ImGui_ImplVulkan_CreateFontsTexture();
+        fontGeneration_++;
+        fontUploadPending_ = false;
     }
 
     void releaseSwapChain(SwapchainInfo& swapchain)
@@ -745,6 +787,9 @@ private:
     {
         auto& vp = viewports_[drawViewport_].Viewport;
         if (!vp.DrawDataP.Valid) return;
+        // bg3le: a frame built against an older font texture would sample a freed one.
+        if (fontUploadPending_ || fontsBroken_
+            || viewports_[drawViewport_].FontGeneration != fontGeneration_) return;
 
         auto& image = swapchain_.images_[pPresentInfo->pImageIndices[0]];
         IMGUI_FRAME_DEBUG("vkQueuePresentKHR: Swap chain image #%d (%p)", pPresentInfo->pImageIndices[0], image.image);
@@ -868,6 +913,12 @@ private:
         }
 
         std::lock_guard _(globalResourceLock_);
+        if (queue != lastPresentQueue_) {
+            lastPresentQueue_ = queue;
+            IMGUI_DEBUG("presenting on queue %p (%s); the overlay submits to %p, %s",
+                queue, bg3le::thread_tag(), renderQueue_, queue == renderQueue_ ? "the same queue" : "a different queue");
+        }
+
         if (!initialized_) {
             IMGUI_DEBUG("vkQueuePresentKHR: Render backend initialized yet");
             frameNo_ = 0;
@@ -887,6 +938,8 @@ private:
                 InitializeUI();
             }
         }
+
+        if (initialized_ && fontUploadPending_) uploadFonts();
 
         if (initialized_ && drawViewport_ != -1) {
             presentPreHook(const_cast<VkPresentInfoKHR*>(pPresentInfo));
@@ -917,6 +970,11 @@ private:
     bool initialized_{ false };
     bool uiFrameworkStarted_{ false };
     bool requestReloadFonts_{ false };
+    // bg3le: see uploadFonts.
+    bool fontUploadPending_{ false };
+    bool fontsBroken_{ false };
+    uint32_t fontGeneration_{ 0 };
+    VkQueue lastPresentQueue_{ VK_NULL_HANDLE };
     std::mutex globalResourceLock_;
 
     HashMap<VkImageView, VkDescriptorSet> textureDescriptors_;

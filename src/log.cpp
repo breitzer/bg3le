@@ -10,8 +10,10 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <mutex>
+#include <pthread.h>
 #include <string>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <vector>
 
@@ -206,5 +208,15 @@ void logf(const char* fmt, ...) {
     write_without_escapes(g_log, text, (std::size_t)length);
     std::fputc('\n', g_log);
     std::fflush(g_log);
+}
+
+const char* thread_tag() {
+    static thread_local char tag[48] = {};
+    if (tag[0] == 0) {
+        char name[16] = {};
+        ::pthread_getname_np(::pthread_self(), name, sizeof(name));
+        std::snprintf(tag, sizeof(tag), "tid %ld %s", (long)::syscall(SYS_gettid), name);
+    }
+    return tag;
 }
 }  // namespace bg3le

@@ -3,6 +3,9 @@ namespace bg3le {
 void log_init();
 void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
+// "tid N name" for the calling thread, for logs that need to say which.
+const char* thread_tag();
+
 // Path of this process's log file, or "" before log_init().
 const char* log_path();
 

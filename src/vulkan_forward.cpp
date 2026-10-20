@@ -34,8 +34,11 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_set>
 
 #include "detour_interpose.h"
@@ -126,6 +129,113 @@ extern "C" VkResult vkCreateInstance(VkInstanceCreateInfo const* info,
 // The physical device the game renders with, for the swapchain check below.
 static VkPhysicalDevice g_physical = VK_NULL_HANDLE;
 
+namespace {
+
+// The driver, the Vulkan layers and the display environment, once.
+void log_environment(VkPhysicalDevice phys) {
+    using Props2 = void (*)(VkPhysicalDevice, VkPhysicalDeviceProperties2*);
+    using Layers = VkResult (*)(uint32_t*, VkLayerProperties*);
+    static const Props2 props = real<Props2>("vkGetPhysicalDeviceProperties2");
+    static const Layers layers = real<Layers>("vkEnumerateInstanceLayerProperties");
+
+    if (props != nullptr) {
+        VkPhysicalDeviceDriverProperties driver{};
+        driver.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+        VkPhysicalDeviceProperties2 p{};
+        p.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        p.pNext = &driver;
+        props(phys, &p);
+        bg3le::logf("vulkan: %s, Vulkan %u.%u.%u, driver %s (%s)", p.properties.deviceName,
+                    VK_API_VERSION_MAJOR(p.properties.apiVersion), VK_API_VERSION_MINOR(p.properties.apiVersion),
+                    VK_API_VERSION_PATCH(p.properties.apiVersion), driver.driverName, driver.driverInfo);
+    }
+    uint32_t n = 0;
+    if (layers != nullptr && layers(&n, nullptr) == VK_SUCCESS && n > 0) {
+        std::unique_ptr<VkLayerProperties[]> all(new VkLayerProperties[n]);
+        if (layers(&n, all.get()) == VK_SUCCESS) {
+            std::string names;
+            for (uint32_t i = 0; i < n; ++i) names += (i ? ", " : "") + std::string(all[i].layerName);
+            bg3le::logf("vulkan: layers available: %s", names.c_str());
+        }
+    }
+    char const* const vars[] = {
+        "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP", "DISPLAY", "WAYLAND_DISPLAY",
+        "SDL_VIDEODRIVER", "GAMESCOPE_WAYLAND_DISPLAY", "ENABLE_GAMESCOPE_WSI",
+        "SteamDeck", "SteamGamepadUI", "SteamOS", "VK_INSTANCE_LAYERS",
+        "VK_LOADER_LAYERS_ENABLE", "VK_LOADER_LAYERS_DISABLE", "MESA_VK_WSI_PRESENT_MODE",
+        "ENABLE_VKBASALT", "MANGOHUD", "LD_PRELOAD",
+    };
+    for (char const* name : vars) {
+        if (char const* v = std::getenv(name)) bg3le::logf("env: %s=%s", name, v);
+    }
+}
+
+// System memory, and the device's heaps against their budgets.
+void log_memory(VkPhysicalDevice phys) {
+    if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+        char line[128];
+        std::string out;
+        while (std::fgets(line, sizeof(line), f) != nullptr) {
+            char key[32];
+            unsigned long long kb = 0;
+            if (std::sscanf(line, "%31[^:]: %llu", key, &kb) != 2) continue;
+            if (std::strcmp(key, "MemTotal") && std::strcmp(key, "MemAvailable")
+                && std::strcmp(key, "SwapTotal") && std::strcmp(key, "SwapFree")) continue;
+            if (!out.empty()) out += ", ";
+            out += std::string(key) + " " + std::to_string(kb >> 10) + " MB";
+        }
+        std::fclose(f);
+        bg3le::logf("memory: %s", out.c_str());
+    }
+
+    using Mem2 = void (*)(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties2*);
+    static const Mem2 mem = real<Mem2>("vkGetPhysicalDeviceMemoryProperties2");
+    if (mem == nullptr || phys == VK_NULL_HANDLE) return;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    VkPhysicalDeviceMemoryProperties2 p{};
+    p.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    p.pNext = &budget;
+    mem(phys, &p);
+    for (uint32_t i = 0; i < p.memoryProperties.memoryHeapCount; ++i) {
+        auto const& heap = p.memoryProperties.memoryHeaps[i];
+        bg3le::logf("memory: heap %u%s: %llu of %llu MB used, budget %llu MB", i,
+                    (heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ? " (device-local)" : "",
+                    (unsigned long long)(budget.heapUsage[i] >> 20), (unsigned long long)(heap.size >> 20),
+                    (unsigned long long)(budget.heapBudget[i] >> 20));
+    }
+}
+
+// What the surface still offers, after a creation failed.
+void log_surface(VkPhysicalDevice phys, VkSurfaceKHR surface) {
+    using Modes = VkResult (*)(VkPhysicalDevice, VkSurfaceKHR, uint32_t*, VkPresentModeKHR*);
+    using Formats = VkResult (*)(VkPhysicalDevice, VkSurfaceKHR, uint32_t*, VkSurfaceFormatKHR*);
+    static const Modes modes = real<Modes>("vkGetPhysicalDeviceSurfacePresentModesKHR");
+    static const Formats formats = real<Formats>("vkGetPhysicalDeviceSurfaceFormatsKHR");
+    if (phys == VK_NULL_HANDLE) return;
+
+    std::string out;
+    if (modes != nullptr) {
+        VkPresentModeKHR list[16];
+        uint32_t n = 16;
+        const VkResult r = modes(phys, surface, &n, list);
+        out += "present modes (" + std::to_string((int)r) + ")";
+        for (uint32_t i = 0; r >= 0 && i < n; ++i) out += " " + std::to_string((int)list[i]);
+    }
+    if (formats != nullptr) {
+        VkSurfaceFormatKHR list[32];
+        uint32_t n = 32;
+        const VkResult r = formats(phys, surface, &n, list);
+        out += "; formats (" + std::to_string((int)r) + ")";
+        for (uint32_t i = 0; r >= 0 && i < n; ++i) {
+            out += " " + std::to_string((int)list[i].format) + "/" + std::to_string((int)list[i].colorSpace);
+        }
+    }
+    bg3le::logf("vulkan: after the failure, the surface offers %s", out.c_str());
+}
+
+}  // namespace
+
 extern "C" VkResult vkCreateDevice(VkPhysicalDevice phys,
                                    VkDeviceCreateInfo const* info,
                                    VkAllocationCallbacks const* alloc,
@@ -134,7 +244,10 @@ extern "C" VkResult vkCreateDevice(VkPhysicalDevice phys,
                             VkAllocationCallbacks const*, VkDevice*);
     static const Fn next = real<Fn>("vkCreateDevice");
     // The first is the game's; a layer such as lsfg-vk may make its own later.
-    if (g_physical == VK_NULL_HANDLE) g_physical = phys;
+    if (g_physical == VK_NULL_HANDLE) {
+        g_physical = phys;
+        log_environment(phys);
+    }
     const Fn take = hooked<Fn>(next);
     if (take != nullptr && take != (Fn)&vkCreateDevice) return take(phys, info, alloc, out);
     return next(phys, info, alloc, out);
@@ -174,14 +287,34 @@ extern "C" VkResult vkCreateSwapchainKHR(VkDevice dev,
         }
     }
 
-    bg3le::logf("vulkan: creating a swapchain, %ux%u format %d colour space %d usage %#x (asked %#x)",
+    bg3le::logf("vulkan: creating a swapchain, %ux%u format %d colour space %d usage %#x (asked %#x), "
+                "present mode %d, %u images, old %p (%s)",
                 copy.imageExtent.width, copy.imageExtent.height, (int)copy.imageFormat,
-                (int)copy.imageColorSpace, (unsigned)copy.imageUsage, (unsigned)info->imageUsage);
+                (int)copy.imageColorSpace, (unsigned)copy.imageUsage, (unsigned)info->imageUsage,
+                (int)copy.presentMode, copy.minImageCount, (void*)copy.oldSwapchain, bg3le::thread_tag());
+    // What the surface wants, against what the game asked for.
+    VkSurfaceCapabilitiesKHR surface{};
+    const VkResult got = caps != nullptr && g_physical != VK_NULL_HANDLE
+        ? caps(g_physical, info->surface, &surface) : VK_ERROR_INITIALIZATION_FAILED;
+    if (got == VK_SUCCESS) {
+        bg3le::logf("vulkan: the surface is %ux%u, extents %ux%u to %ux%u, %u to %u images",
+                    surface.currentExtent.width, surface.currentExtent.height,
+                    surface.minImageExtent.width, surface.minImageExtent.height,
+                    surface.maxImageExtent.width, surface.maxImageExtent.height,
+                    surface.minImageCount, surface.maxImageCount);
+    } else {
+        bg3le::logf("vulkan: the surface's capabilities could not be read (%d)", (int)got);
+    }
+    log_memory(g_physical);
     const Fn take = hooked<Fn>(next);
     const VkResult result = (take != nullptr && take != (Fn)&vkCreateSwapchainKHR)
         ? take(dev, &copy, alloc, out)
         : next(dev, &copy, alloc, out);
     bg3le::logf("vulkan: swapchain created: %d", (int)result);
+    if (result != VK_SUCCESS) {
+        log_surface(g_physical, info->surface);
+        log_memory(g_physical);
+    }
     return result;
 }
 
@@ -274,8 +407,32 @@ BG3LE_FORWARD(void, vkDestroySwapchainKHR,
                VkAllocationCallbacks const* alloc),
               (dev, chain, alloc))
 
-BG3LE_FORWARD(VkResult, vkQueuePresentKHR,
-              (VkQueue queue, VkPresentInfoKHR const* info), (queue, info))
+namespace {
+
+// A present that is not VK_SUCCESS is what tells the game to rebuild its
+// swapchain. The first few of each kind, then each doubling.
+void note_present(VkResult result) {
+    static std::atomic<unsigned> suboptimal{0}, out_of_date{0}, other{0};
+    std::atomic<unsigned>& count = result == VK_SUBOPTIMAL_KHR ? suboptimal
+        : result == VK_ERROR_OUT_OF_DATE_KHR ? out_of_date : other;
+    const unsigned n = ++count;
+    if (n <= 5 || (n & (n - 1)) == 0) {
+        bg3le::logf("vulkan: present returned %d (%u so far) on %s", (int)result, n,
+                    bg3le::thread_tag());
+    }
+}
+
+}  // namespace
+
+extern "C" VkResult vkQueuePresentKHR(VkQueue queue, VkPresentInfoKHR const* info) {
+    using Fn = VkResult (*)(VkQueue, VkPresentInfoKHR const*);
+    static const Fn next = real<Fn>("vkQueuePresentKHR");
+    const Fn take = hooked<Fn>(next);
+    const VkResult result = (take != nullptr && take != (Fn)&vkQueuePresentKHR)
+        ? take(queue, info) : next(queue, info);
+    if (result != VK_SUCCESS) note_present(result);
+    return result;
+}
 
 #undef BG3LE_FORWARD
 
