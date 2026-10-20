@@ -168,7 +168,9 @@ inside.
     tools/build-sniper.sh   # build-sniper/bg3le/libbg3le.so
     tools/package.sh        # dist/bg3le-<version>-linux-x86_64.zip
 
-`build-sniper.sh` needs Docker. It unpacks the sniper SDK image as a sysroot,
+`build-sniper.sh` needs Docker, clang, CMake, Ninja and Git. It fetches dependency
+sources without building against the host libc++, so no host libc++ installation
+is required. It unpacks the sniper SDK image as a sysroot,
 builds libc++ (from the LLVM release matching the host clang), abseil and
 protobuf against it, then bg3le with the host's clang
 (`cmake/sniper-toolchain.cmake`), and fails if the result asks for any glibc

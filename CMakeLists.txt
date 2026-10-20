@@ -71,7 +71,8 @@ link_libraries(${LIBCXX_STATIC} ${LIBCXXABI_STATIC})
 set(BG3LE_LIBCXX_ABI_FLAGS -D_LIBCPP_ABI_VARIANT_INDEX_TYPE_OPTIMIZATION)
 add_compile_options(${BG3LE_LIBCXX_ABI_FLAGS})
 
-set(BG3LE_ABI_STAMP ${CMAKE_CURRENT_SOURCE_DIR}/external/third_party/.libcxx-abi-flags)
+set(BG3LE_ABI_STAMP "${CMAKE_CURRENT_SOURCE_DIR}/external/third_party/.libcxx-abi-flags"
+    CACHE FILEPATH "ABI stamp for the selected abseil and protobuf builds")
 if(EXISTS ${BG3LE_ABI_STAMP})
     file(READ ${BG3LE_ABI_STAMP} BG3LE_EXTERNALS_ABI)
     string(STRIP "${BG3LE_EXTERNALS_ABI}" BG3LE_EXTERNALS_ABI)
