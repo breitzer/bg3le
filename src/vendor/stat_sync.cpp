@@ -15,8 +15,11 @@
 #include <GameDefinitions/Stats/Stats.h>
 #include <GameDefinitions/Stats/Prototype.h>
 
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
 
 #include "../log.h"
 #include "../resolve.h"
@@ -485,7 +488,16 @@ extern "C" char const* bg3le_stats_sync(char const* name) {
     auto* object = (bg3se::stats::Object*)bg3le_stats_find(name);
     if (object == nullptr) return "no such stat";
     // The engine builds every prototype from the stats once RPGStats::Load returns.
-    if (bg3le_stats_is_loading()) return nullptr;
+    if (bg3le_stats_is_loading()) {
+        // Debug: who syncs during the load, and how often.
+        static std::atomic<unsigned> said{0};
+        const unsigned n = ++said;
+        if (n <= 20 || n % 500 == 0) {
+            logf("stats debug: Sync(%s) inside RPGStats::Load, left to the engine's prototype build (%u so far)",
+                 name, n);
+        }
+        return nullptr;
+    }
     char const* type = bg3le_stats_type(object);
     if (type == nullptr) return nullptr;
 
@@ -508,4 +520,76 @@ extern "C" char const* bg3le_stats_sync(char const* name) {
         return sync_passive(object, name);
     }
     return nullptr;
+}
+
+extern "C" char const* bg3le_fixed_string(std::uint32_t index, std::uint32_t* length);
+extern "C" char const* bg3le_stats_attr_condition(int raw);
+
+// Debug: passive prototypes whose compiled conditions are not the text their
+// stat holds now -- what reassigning Conditions and calling Sync() repairs.
+// Reads the engine's map with safe reads, so it may run while the map changes.
+extern "C" void bg3le_prototypes_debug_check_passives(void const* mapAt, char const* when) {
+    using namespace bg3le;
+    RawRefMap map{};
+    if (mapAt == nullptr || !safe_read(mapAt, &map, sizeof(map)) || map.HashTable == nullptr
+        || map.HashSize == 0 || map.HashSize > (1u << 20)) {
+        logf("stats debug: passive check (%s): the map is not readable", when);
+        return;
+    }
+    auto text_of = [](int raw) -> std::string {
+        char const* text = raw < 0 ? "" : bg3le_stats_attr_condition(raw);
+        return text != nullptr ? text : "<unreadable>";
+    };
+    auto stat_raw = [](void const* object, char const* attr) -> int {
+        const int index = bg3le_stats_attr_index(object, attr);
+        char const* name = nullptr;
+        char const* type = nullptr;
+        int kind = 0;
+        int raw = -1;
+        if (index < 0 || !bg3le_stats_attr_at(object, (std::size_t)index, &name, &type, &kind, &raw)) return -1;
+        return raw;
+    };
+
+    std::size_t checked = 0, indexDiffers = 0, textDiffers = 0, said = 0;
+    for (std::uint32_t b = 0; b < map.HashSize; ++b) {
+        PassiveNode* node = nullptr;
+        if (!safe_read(map.HashTable + b, &node, sizeof(node))) break;
+        for (std::size_t hops = 0; node != nullptr && hops < 64; ++hops) {
+            // Raw bytes: a PassivePrototype copy would destruct the engine's arrays.
+            alignas(PassiveNode) unsigned char raw[sizeof(PassiveNode)];
+            if (!safe_read(node, raw, sizeof(raw))) break;
+            auto field = [&raw](std::size_t at, auto* out) { std::memcpy(out, raw + at, sizeof(*out)); };
+            std::uint32_t key = 0;
+            std::int32_t conditions = -1;
+            std::int32_t boostConditions = -1;
+            field(offsetof(PassiveNode, Next), &node);
+            field(offsetof(PassiveNode, Key), &key);
+            field(offsetof(PassiveNode, Value) + offsetof(PassivePrototype, ConditionsIndex), &conditions);
+            field(offsetof(PassiveNode, Value) + offsetof(PassivePrototype, BoostConditionsIndex),
+                  &boostConditions);
+            char const* name = bg3le_fixed_string(key, nullptr);
+            void const* object = name != nullptr ? bg3le_stats_find(name) : nullptr;
+            if (object == nullptr) continue;
+            ++checked;
+            struct { char const* Attr; int Proto; } pairs[] = {
+                {"Conditions", conditions},
+                {"BoostConditions", boostConditions},
+            };
+            for (auto const& pair : pairs) {
+                const int raw = stat_raw(object, pair.Attr);
+                if (raw == pair.Proto) continue;
+                ++indexDiffers;
+                const std::string proto = text_of(pair.Proto);
+                const std::string stat = text_of(raw);
+                if (proto == stat) continue;
+                ++textDiffers;
+                if (++said <= 15) {
+                    logf("stats debug: passive %s %s: prototype has #%d \"%.80s\", stat has #%d \"%.80s\"",
+                         name, pair.Attr, pair.Proto, proto.c_str(), raw, stat.c_str());
+                }
+            }
+        }
+    }
+    logf("stats debug: passive check (%s): %zu passives, %zu condition indices differ from the stat's, "
+         "%zu of them in text", when, checked, indexDiffers, textDiffers);
 }

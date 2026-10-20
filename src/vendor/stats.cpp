@@ -2352,6 +2352,34 @@ extern "C" int bg3le_stats_condition_intern(char const* text) {
     return (int)slot;
 }
 
+// Debug: what the stats hold right now, for the StatsLoaded log lines.
+extern "C" void bg3le_stats_debug_summary(char const* when) {
+    const CacheLock lock(stats_cache_lock());
+    if (!ready()) {
+        logf("stats debug: %s: the stats are not found (module load %u, generation %u)", when,
+             g_module_loads.load(), g_generation);
+        return;
+    }
+    Found const& f = state();
+    std::size_t spells = 0, statuses = 0, passives = 0, interrupts = 0;
+    for (std::size_t i = 0; i < f.Objects.Size; ++i) {
+        void const* object = nullptr;
+        if (!read_as((char const*)f.Objects.Buffer + i * sizeof(void*), &object) || object == nullptr) continue;
+        char const* type = bg3le_stats_type(object);
+        if (type == nullptr) continue;
+        if (std::strcmp(type, "SpellData") == 0) ++spells;
+        else if (std::strcmp(type, "StatusData") == 0) ++statuses;
+        else if (std::strcmp(type, "PassiveData") == 0) ++passives;
+        else if (std::strcmp(type, "InterruptData") == 0) ++interrupts;
+    }
+    std::uint32_t conditions = 0;
+    if (f.ConditionsHeader != nullptr) read_as((char const*)f.ConditionsHeader + 12, &conditions);
+    logf("stats debug: %s: %zu stats (%zu spells, %zu statuses, %zu passives, %zu interrupts); "
+         "condition pool %u, %zu written by bg3le; first object %p; module load %u, generation %u",
+         when, (std::size_t)f.Objects.Size, spells, statuses, passives, interrupts, conditions,
+         conditions_taken(), first_object(f), g_module_loads.load(), g_generation);
+}
+
 // The pool index for a FixedString attribute's text.
 //
 // Two steps, because the pool holds string-table ids rather than text: get

@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -31,6 +32,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "../game_state.h"
 #include "../log.h"
 #include "../mem.h"
 
@@ -49,8 +51,15 @@ extern "C" std::size_t bg3le_static_count(char const* key);
 extern "C" void bg3le_static_confirm(char const* key, std::size_t which);
 extern "C" bool bg3le_static_record_path(char const* key, void const* target,
                                          std::uint64_t first_window);
+extern "C" bool bg3le_stats_is_loading();
+extern "C" void bg3le_prototypes_debug_check_passives(void const* mapAt, char const* when);
 
 namespace {
+
+char const* client_game_state_or_unknown() {
+    char const* now = client_game_state();
+    return now != nullptr ? now : "unknown";
+}
 
 // A bg3se HashMap: HashKeys, NextIds, Keys, then Values.
 constexpr std::size_t kKeysBuffer = 32;
@@ -182,6 +191,8 @@ struct Prototypes {
     // without that the handoff is a data race and the reader can see an
     // empty map.
     std::atomic<bool> Built{false};
+    // Per kind, so one that resolved is usable while another is still missing.
+    std::atomic<bool> Ready[std::size(kKinds)]{};
     Table Kinds[std::size(kKinds)];
 };
 
@@ -518,54 +529,119 @@ bool harvest_map(unsigned long long at, std::size_t k, Table* into) {
     return true;
 }
 
+std::mutex& tables_lock();
+
+bool all_ready() {
+    for (auto const& ready : state().Ready) {
+        if (!ready.load(std::memory_order_acquire)) return false;
+    }
+    return true;
+}
+
+// Makes one kind's table live, under the lock lookups of the others hold.
+void publish(std::size_t k, Table&& table) {
+    table.Order.clear();
+    table.Order.reserve(table.ByName.size());
+    for (auto const& entry : table.ByName) table.Order.push_back(entry.first);
+    const auto mapAt = (void const*)(std::uintptr_t)table.MapAt;
+    {
+        const std::lock_guard<std::mutex> held(tables_lock());
+        state().Kinds[k] = std::move(table);
+        state().Ready[k].store(true, std::memory_order_release);
+    }
+    if (k == kPassive) bg3le_prototypes_debug_check_passives(mapAt, "first found");
+}
+
+// What a recorded manager holds now, for the log when it is not usable yet.
+std::string describe_map(unsigned long long at, std::size_t k) {
+    auto const* head = (char const*)(std::uintptr_t)at;
+    char text[160];
+    if (k == kPassive) {
+        std::uint32_t items = 0;
+        std::uint32_t buckets = 0;
+        if (!read_as(head, &items) || !read_as(head + 4, &buckets)) return "unreadable";
+        std::snprintf(text, sizeof(text), "%u items in %u buckets", items, buckets);
+        return text;
+    }
+    std::uint32_t capacity = 0;
+    std::uint32_t count = 0;
+    std::uint64_t keys = 0;
+    if (!read_as(head + kKeysCapacity, &capacity) || !read_as(head + kKeysSize, &count)
+        || !read_as(head + kKeysBuffer, &keys)) {
+        return "unreadable";
+    }
+    const int kind = count > 0 ? kind_of((void const*)(std::uintptr_t)keys, count) : -1;
+    std::snprintf(text, sizeof(text), "%u of %u entries, names %s", count, capacity,
+                  kind < 0 ? "unclassified" : kKinds[kind].Name);
+    return text;
+}
+
 // The managers a previous run recorded a path to, with no scanning.
 //
-// Published only when every kind resolves, and tried once: a cache that
-// lacks a kind -- one recorded before that kind could be found -- leaves
-// the scan to look for all of them.
+// Each kind is published as soon as it resolves and the rest are tried again
+// on later calls, at most twice a second. A manager the engine has not filled
+// yet fails the check, and dropping the kinds that had resolved with it left
+// Sync and GetCached* unavailable until the warming thread's scan.
 bool build_from_statics() {
-    static std::atomic<bool> tried{false};
-    if (tried.exchange(true)) return false;
+    if (all_ready()) return true;
 
-    struct { Table Kinds[std::size(kKinds)]; } found{};
+    // Any thread may call this; one resolves at a time.
+    static std::mutex resolving;
+    const std::unique_lock<std::mutex> held(resolving, std::try_to_lock);
+    if (!held.owns_lock()) return false;
+    static std::chrono::steady_clock::time_point last{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::milliseconds(500)) return false;
+    last = now;
+
+    static std::string reasons[std::size(kKinds)];
+    static unsigned said[std::size(kKinds)] = {};
     std::size_t kinds = 0;
-
     for (std::size_t k = 0; k < std::size(kKinds); ++k) {
+        if (state().Ready[k].load(std::memory_order_acquire)) {
+            ++kinds;
+            continue;
+        }
         const std::string key = static_key(k);
         const std::size_t count = bg3le_static_count(key.c_str());
+        std::string why = count == 0 ? "no recorded path" : "";
         for (std::size_t i = 0; i < count; ++i) {
             void* at = bg3le_static_get(key.c_str(), i);
             if (at == nullptr) continue;
-            if (!harvest_map((unsigned long long)(std::uintptr_t)at, k,
-                             &found.Kinds[k])) {
-                found.Kinds[k].ByName.clear();
+            Table found;
+            if (!harvest_map((unsigned long long)(std::uintptr_t)at, k, &found)) {
+                if (why.empty()) why = describe_map((unsigned long long)(std::uintptr_t)at, k);
                 continue;
             }
             logf("prototypes: %zu %s prototypes at %p without scanning, "
                  "from recorded static %zu of %zu",
-                 found.Kinds[k].ByName.size(), kKinds[k].Name, at, i, count);
+                 found.ByName.size(), kKinds[k].Name, at, i, count);
             bg3le_static_confirm(key.c_str(), i);
+            publish(k, std::move(found));
             ++kinds;
+            why.clear();
             break;
         }
+        // Debug: what the first recorded path held, each time that changes.
+        if (!why.empty() && why != reasons[k] && said[k] < 20) {
+            ++said[k];
+            reasons[k] = why;
+            logf("prototypes: %s manager not usable from its recorded path yet (%s; game state %s%s)",
+                 kKinds[k].Name, why.c_str(), client_game_state_or_unknown(),
+                 bg3le_stats_is_loading() ? ", inside RPGStats::Load" : "");
+        }
     }
 
+    static std::size_t reported = ~std::size_t{0};
     if (kinds < std::size(kKinds)) {
-        logf("prototypes: %zu of %zu managers have a recorded path; "
-             "scanning for all of them", kinds, std::size(kKinds));
+        if (kinds != reported) {
+            reported = kinds;
+            logf("prototypes: %zu of %zu managers resolved from a recorded path; "
+                 "the rest are tried again and scanned for", kinds, std::size(kKinds));
+        }
         return false;
     }
-
-    Prototypes& live = state();
-    for (std::size_t k = 0; k < std::size(kKinds); ++k) {
-        Table& table = found.Kinds[k];
-        table.Order.reserve(table.ByName.size());
-        for (auto const& entry : table.ByName) {
-            table.Order.push_back(entry.first);
-        }
-        live.Kinds[k] = std::move(table);
-    }
-    live.Built.store(true, std::memory_order_release);
+    state().Built.store(true, std::memory_order_release);
     return true;
 }
 
@@ -809,19 +885,18 @@ bool build() {
         return false;
     }
 
+    std::size_t sizes[std::size(kKinds)] = {};
     for (std::size_t k = 0; k < std::size(kKinds); ++k) {
-        Table& table = found.Kinds[k];
-        table.Order.reserve(table.ByName.size());
-        for (auto const& entry : table.ByName) {
-            table.Order.push_back(entry.first);
-        }
-        read_signature(table.MapAt, k, &table.Sig);
+        sizes[k] = found.Kinds[k].ByName.size();
+        read_signature(found.Kinds[k].MapAt, k, &found.Kinds[k].Sig);
     }
 
-    // Filled first, published second.
+    // Filled first, published second; a kind already resolved from its
+    // recorded path keeps that table.
     Prototypes& live = state();
     for (std::size_t k = 0; k < std::size(kKinds); ++k) {
-        live.Kinds[k] = std::move(found.Kinds[k]);
+        if (sizes[k] == 0 || live.Ready[k].load(std::memory_order_acquire)) continue;
+        publish(k, std::move(found.Kinds[k]));
     }
     live.Built.store(true, std::memory_order_release);
 
@@ -837,10 +912,8 @@ bool build() {
     }
 
     logf("prototypes: %zu spells, %zu statuses, %zu interrupts and %zu "
-         "passives available",
-         live.Kinds[kSpell].ByName.size(), live.Kinds[kStatus].ByName.size(),
-         live.Kinds[kInterrupt].ByName.size(),
-         live.Kinds[kPassive].ByName.size());
+         "passives found by the scan",
+         sizes[kSpell], sizes[kStatus], sizes[kInterrupt], sizes[kPassive]);
     return true;
 }
 
@@ -865,10 +938,18 @@ std::mutex& tables_lock() {
     return m;
 }
 
-// The table for a kind once built, or null. Ready is checked before the
-// lock is taken: the first build can scan for seconds.
+// Whether a kind's table is live, trying its recorded path again if not.
+bool kind_ready(std::size_t k) {
+    std::atomic<bool> const& live = state().Ready[k];
+    if (live.load(std::memory_order_acquire)) return true;
+    if (!build_from_statics() && !live.load(std::memory_order_acquire)) ready();
+    return live.load(std::memory_order_acquire);
+}
+
+// The table for a kind once found, or null. Checked before the lock is
+// taken: the first build can scan for seconds, and publishing takes it.
 Table* table_of(int kind) {
-    if (!ready() || kind < 0 || (std::size_t)kind >= std::size(kKinds)) {
+    if (kind < 0 || (std::size_t)kind >= std::size(kKinds) || !kind_ready((std::size_t)kind)) {
         return nullptr;
     }
     return &state().Kinds[kind];
@@ -877,7 +958,8 @@ Table* table_of(int kind) {
 // Reads a kind's table again from the engine's map, which the engine
 // rebuilds when a save loads: every prototype the old table points at is
 // freed then. The manager may have moved with it, so its recorded path is
-// tried as well. On failure the table is emptied rather than left stale.
+// tried as well. On failure the table is emptied rather than left stale, and
+// the kind is looked for again from its recorded path on the next call.
 bool refresh(std::size_t k) {
     Table& table = state().Kinds[k];
     Table fresh;
@@ -890,15 +972,21 @@ bool refresh(std::size_t k) {
     }
     if (!ok) {
         logf("prototypes: the engine rebuilt its %s prototypes and they could not be "
-             "read again; lookups return nothing", kKinds[k].Name);
+             "read again (%s; game state %s); retrying from the recorded path",
+             kKinds[k].Name, describe_map(table.MapAt, k).c_str(), client_game_state_or_unknown());
         table = Table{};
+        state().Ready[k].store(false, std::memory_order_release);
         return false;
     }
     fresh.Order.reserve(fresh.ByName.size());
     for (auto const& entry : fresh.ByName) fresh.Order.push_back(entry.first);
-    logf("prototypes: the engine rebuilt its %s prototypes; read %zu again (was %zu)",
-         kKinds[k].Name, fresh.ByName.size(), table.ByName.size());
+    logf("prototypes: the engine rebuilt its %s prototypes; read %zu again (was %zu; game state %s)",
+         kKinds[k].Name, fresh.ByName.size(), table.ByName.size(), client_game_state_or_unknown());
     table = std::move(fresh);
+    if (k == kPassive) {
+        bg3le_prototypes_debug_check_passives((void const*)(std::uintptr_t)table.MapAt,
+                                              "after the engine rebuilt them");
+    }
     return true;
 }
 
@@ -929,9 +1017,10 @@ bool still_held(Table const& table, std::size_t k, std::string const& name, std:
 }
 
 // The table, read again first if the engine has rebuilt its map since.
+// Called under the tables lock, so not through table_of, which may publish.
 Table* current_table(int kind) {
-    Table* table = table_of(kind);
-    if (table != nullptr && table->MapAt != 0 && !signature_current(*table, (std::size_t)kind)) {
+    Table* table = &state().Kinds[kind];
+    if (table->MapAt != 0 && !signature_current(*table, (std::size_t)kind)) {
         refresh((std::size_t)kind);
     }
     return table;
