@@ -3,6 +3,7 @@
 # Fetches the third-party dependencies that vendor/bg3se needs, into
 # external/third_party/. Kept separate from external/lua, which is bg3le's own
 # vendored Lua 5.4.9 and is tracked in git.
+# Pass --sources-only to fetch and patch sources without building host libraries.
 # Derived from External/pull-externals.bat in the BG3 Script Extender by
 # Norbyte and the bg3se contributors (https://github.com/Norbyte/bg3se),
 # MIT + Commons Clause. With thanks to them.
@@ -13,6 +14,13 @@
 # vendor/compat implements the two concurrent containers bg3se needs over the
 # standard library, because libtbb is not in that container.
 set -euo pipefail
+
+SOURCES_ONLY=false
+case "${1:-}" in
+    --sources-only) SOURCES_ONLY=true ;;
+    "") ;;
+    *) echo "Usage: $0 [--sources-only]" >&2; exit 2 ;;
+esac
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 EXT="$ROOT/external/third_party"
@@ -36,7 +44,7 @@ cd "$EXT"
 # against externals built with anything else. The stamp is how it knows.
 LIBCXX_ABI_FLAGS="-D_LIBCPP_ABI_VARIANT_INDEX_TYPE_OPTIMIZATION"
 ABI_STAMP="$EXT/.libcxx-abi-flags"
-if [ "$(cat "$ABI_STAMP" 2>/dev/null || true)" != "$LIBCXX_ABI_FLAGS" ]; then
+if [ "$SOURCES_ONLY" = false ] && [ "$(cat "$ABI_STAMP" 2>/dev/null || true)" != "$LIBCXX_ABI_FLAGS" ]; then
     # Built with some other layout, or before this was recorded at all: the
     # prebuilt archives are the thing that disagrees, so they go.
     if [ -d "$EXT/abseil/build" ] || [ -d "$EXT/protobuf/build" ]; then
@@ -72,65 +80,65 @@ clone tinycrypt https://github.com/intel/tinycrypt
 clone Vulkan    https://github.com/KhronosGroup/Vulkan-Headers vulkan-sdk-1.4.357
 clone optick    https://github.com/Norbyte/optick
 
-echo "== abseil (built from source against libc++) =="
-# protobuf needs abseil, and 45 of the symbols it calls take or return
-# std::string. The distribution abseil is libstdc++, so it has to be rebuilt
-# too or the mismatch just moves one layer down. The version has to match
-# whatever protobuf expects.
-ABSL_PREFIX="$EXT/abseil/install"
-if [ ! -f "$ABSL_PREFIX/lib/libabsl_strings.a" ]; then
-    if [ ! -d abseil ]; then
-        git clone --depth 1 --branch 20260817.0 \
-            https://github.com/abseil/abseil-cpp abseil
-    fi
-    cmake -S abseil -B abseil/build -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_CXX_COMPILER=clang++ \
-        -DCMAKE_C_COMPILER=clang \
-        -DCMAKE_CXX_FLAGS="-stdlib=libc++ $LIBCXX_ABI_FLAGS" \
-        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-        -DCMAKE_CXX_STANDARD=17 \
-        -DABSL_PROPAGATE_CXX_STD=ON \
-        -DABSL_ENABLE_INSTALL=ON \
-        -DBUILD_TESTING=OFF \
-        -DCMAKE_INSTALL_PREFIX="$ABSL_PREFIX"
-    cmake --build abseil/build
-    cmake --install abseil/build
-else
-    echo "  abseil: present"
+clone abseil https://github.com/abseil/abseil-cpp 20260817.0
+if [ ! -d protobuf ]; then
+    git clone --depth 1 --branch v36.1 --recurse-submodules --shallow-submodules \
+        https://github.com/protocolbuffers/protobuf protobuf
 fi
 
-echo "== protobuf (built from source against libc++) =="
-# The distribution package is built against libstdc++ and exports
-# std::__cxx11 symbols. bg3se's generated message code is part of the extender
-# core, not just its networking, so it has to link a protobuf whose
-# std::string matches ours -- mixing the two ABIs in one process is not
-# something that fails loudly at runtime. Upstream builds protobuf from source
-# on Windows for the same reason.
-if [ -d protobuf/build/libprotobuf-lite.a ] || [ -f protobuf/build/libprotobuf-lite.a ]; then
-    echo "  protobuf: present"
-else
-    if [ ! -d protobuf ]; then
-        git clone --depth 1 --branch v36.1 --recurse-submodules --shallow-submodules \
-            https://github.com/protocolbuffers/protobuf protobuf
+if [ "$SOURCES_ONLY" = false ]; then
+    echo "== abseil (built from source against libc++) =="
+    # protobuf needs abseil, and 45 of the symbols it calls take or return
+    # std::string. The distribution abseil is libstdc++, so it has to be rebuilt
+    # too or the mismatch just moves one layer down. The version has to match
+    # whatever protobuf expects.
+    ABSL_PREFIX="$EXT/abseil/install"
+    if [ ! -f "$ABSL_PREFIX/lib/libabsl_strings.a" ]; then
+        cmake -S abseil -B abseil/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_FLAGS="-stdlib=libc++ $LIBCXX_ABI_FLAGS" \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_CXX_STANDARD=17 \
+            -DABSL_PROPAGATE_CXX_STD=ON \
+            -DABSL_ENABLE_INSTALL=ON \
+            -DBUILD_TESTING=OFF \
+            -DCMAKE_INSTALL_PREFIX="$ABSL_PREFIX"
+        cmake --build abseil/build
+        cmake --install abseil/build
+    else
+        echo "  abseil: present"
     fi
-    cmake -S protobuf -B protobuf/build -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_CXX_COMPILER=clang++ \
-        -DCMAKE_C_COMPILER=clang \
-        -DCMAKE_CXX_FLAGS="-stdlib=libc++ $LIBCXX_ABI_FLAGS" \
-        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-        -DCMAKE_CXX_STANDARD=17 \
-        -Dprotobuf_BUILD_TESTS=OFF \
-        -Dprotobuf_BUILD_PROTOC_BINARIES=OFF \
-        -Dprotobuf_BUILD_SHARED_LIBS=OFF \
-        -Dprotobuf_ABSL_PROVIDER=package \
-        -DCMAKE_PREFIX_PATH="$ABSL_PREFIX"
-    cmake --build protobuf/build --target libprotobuf-lite
-fi
 
-# Only once both have been built with the flags above.
-echo "$LIBCXX_ABI_FLAGS" > "$ABI_STAMP"
+    echo "== protobuf (built from source against libc++) =="
+    # The distribution package is built against libstdc++ and exports
+    # std::__cxx11 symbols. bg3se's generated message code is part of the extender
+    # core, not just its networking, so it has to link a protobuf whose
+    # std::string matches ours -- mixing the two ABIs in one process is not
+    # something that fails loudly at runtime. Upstream builds protobuf from source
+    # on Windows for the same reason.
+    if [ -d protobuf/build/libprotobuf-lite.a ] || [ -f protobuf/build/libprotobuf-lite.a ]; then
+        echo "  protobuf: present"
+    else
+        cmake -S protobuf -B protobuf/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_FLAGS="-stdlib=libc++ $LIBCXX_ABI_FLAGS" \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_CXX_STANDARD=17 \
+            -Dprotobuf_BUILD_TESTS=OFF \
+            -Dprotobuf_BUILD_PROTOC_BINARIES=OFF \
+            -Dprotobuf_BUILD_SHARED_LIBS=OFF \
+            -Dprotobuf_ABSL_PROVIDER=package \
+            -DCMAKE_PREFIX_PATH="$ABSL_PREFIX"
+        cmake --build protobuf/build --target libprotobuf-lite
+    fi
+
+    # Only once both have been built with the flags above.
+    echo "$LIBCXX_ABI_FLAGS" > "$ABI_STAMP"
+fi
 
 echo "== patch Noesis for clang =="
 # NsCore/TypePropertyImpl.h marks void Get(const void*, void*) const as

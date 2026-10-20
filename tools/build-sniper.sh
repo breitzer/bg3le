@@ -31,10 +31,8 @@ export BG3LE_SNIPER_SYSROOT="$OUT/sysroot"
 LIBCXX="$OUT/libcxx"
 mkdir -p "$OUT"
 
-if [ ! -d "$EXT/abseil" ] || [ ! -d "$EXT/protobuf" ]; then
-    echo "== externals missing; fetching =="
-    "$ROOT/tools/fetch-externals.sh"
-fi
+# Fetch and patch sources without requiring a host libc++ installation.
+"$ROOT/tools/fetch-externals.sh" --sources-only
 
 echo "== sysroot: $IMAGE =="
 if [ -f "$BG3LE_SNIPER_SYSROOT/.image" ]; then
@@ -141,6 +139,9 @@ else
     cmake --build "$PROTOBUF" --target libprotobuf-lite
 fi
 
+# Record the ABI of these archives independently of the host builds.
+echo "$LIBCXX_ABI_FLAGS" > "$OUT/.libcxx-abi-flags"
+
 echo "== bg3le =="
 # The archives by path: the sysroot might carry a libc++ of its own for find_library to prefer.
 cmake -S "$ROOT" -B "$OUT/bg3le" -G Ninja \
@@ -149,6 +150,7 @@ cmake -S "$ROOT" -B "$OUT/bg3le" -G Ninja \
     -DLIBCXX_STATIC="$LIBCXX/lib/libc++.a" \
     -DLIBCXXABI_STATIC="$LIBCXX/lib/libc++abi.a" \
     -DBG3LE_PROTOBUF_BUILD="$PROTOBUF" \
+    -DBG3LE_ABI_STAMP="$OUT/.libcxx-abi-flags" \
     -DABSL_PREFIX="$ABSL"
 cmake --build "$OUT/bg3le" --target bg3le
 
