@@ -606,6 +606,8 @@ extern "C" int bg3le_stats_roll_condition_count(void const* object, char const* 
 extern "C" int bg3le_stats_roll_condition_raw(void const* object, char const* attribute, int index);
 extern "C" std::size_t bg3le_prototype_count(int kind);
 extern "C" char const* bg3le_prototype_name_at(int kind, std::size_t index);
+extern "C" void* bg3le_stats_at(std::size_t index);
+extern "C" char const* bg3le_stats_name(void const* object);
 
 namespace bg3le {
 namespace {
@@ -661,6 +663,12 @@ std::int32_t read_condition(void const* proto, std::size_t at) {
     return proto != nullptr && safe_read((char const*)proto + at, &raw, sizeof(raw)) ? raw : -1;
 }
 
+// The name of the stat a prototype's StatsObjectIndex points at now.
+std::string indexed_name(int index) {
+    char const* name = index >= 0 ? bg3le_stats_name(bg3le_stats_at((std::size_t)index)) : nullptr;
+    return name != nullptr ? name : "<no stat>";
+}
+
 void watch_one(std::string const& name, char const* when, bool prototypes) {
     void const* object = bg3le_stats_find(name.c_str());
     if (object == nullptr) {
@@ -706,6 +714,9 @@ void watch_one(std::string const& name, char const* when, bool prototypes) {
             logf("stats debug: watch (%s) %s: no spell prototype to read", when, name.c_str());
             return;
         }
+        const int index = read_condition(proto, offsetof(SpellPrototype, StatsObjectIndex));
+        logf("stats debug: watch (%s) %s prototype StatsObjectIndex %d -> %s", when, name.c_str(), index,
+             indexed_name(index).c_str());
         for (auto const& entry : meta) {
             logf("stats debug: watch (%s) %s prototype meta type %u = #%d \"%.200s\"", when, name.c_str(),
                  (unsigned)entry.first, entry.second, live_text(entry.second).c_str());
@@ -718,6 +729,17 @@ void watch_one(std::string const& name, char const* when, bool prototypes) {
         logf("stats debug: watch (%s) %s prototype%s: Conditions #%d \"%.200s\", BoostConditions #%d \"%.200s\"",
              when, name.c_str(), proto == nullptr ? " not found" : "", conditions, live_text(conditions).c_str(),
              boost, live_text(boost).c_str());
+    } else if (std::strcmp(type, "StatusData") == 0) {
+        void const* proto = bg3le_prototype_find(1, name.c_str());
+        if (proto == nullptr) {
+            logf("stats debug: watch (%s) %s: no status prototype to read", when, name.c_str());
+            return;
+        }
+        const int index = read_condition(proto, offsetof(StatusPrototype, StatsObjectIndex));
+        // Array<Guid>: buffer, capacity, size.
+        const int boosts = read_condition(proto, offsetof(StatusPrototype, Boosts) + 12);
+        logf("stats debug: watch (%s) %s prototype at %p: StatsObjectIndex %d -> %s, %d boosts", when,
+             name.c_str(), proto, index, indexed_name(index).c_str(), boosts);
     } else if (std::strcmp(type, "InterruptData") == 0) {
         void const* proto = bg3le_prototype_find(2, name.c_str());
         const int conditions = read_condition(proto, offsetof(InterruptPrototype, Conditions));
@@ -763,6 +785,36 @@ extern "C" void bg3le_prototypes_debug_check_spells(char const* when) {
         if (++said > 40) break;
         logf("stats debug: spell check (%s): meta type %u #%d used by %zu: \"%.120s\"", when, (unsigned)key.first,
              key.second, count, live_text(key.second).c_str());
+    }
+}
+
+// Debug: spell and status prototypes whose StatsObjectIndex no longer names
+// their own stat, as one left over from an earlier stats load would.
+extern "C" void bg3le_prototypes_debug_check_indices(char const* when) {
+    using namespace bg3le;
+    for (int kind : {0, 1}) {
+        char const* kindName = kind == 0 ? "spell" : "status";
+        const std::size_t at = kind == 0 ? offsetof(SpellPrototype, StatsObjectIndex)
+                                         : offsetof(StatusPrototype, StatsObjectIndex);
+        std::size_t checked = 0, wrong = 0, missing = 0;
+        for (std::size_t i = 0, n = bg3le_prototype_count(kind); i < n; ++i) {
+            char const* entry = bg3le_prototype_name_at(kind, i);
+            if (entry == nullptr) continue;
+            const std::string name = entry;
+            void const* proto = bg3le_prototype_find(kind, name.c_str());
+            if (proto == nullptr) continue;
+            ++checked;
+            const int index = read_condition(proto, at);
+            const std::string held = indexed_name(index);
+            if (held == name) continue;
+            if (held == "<no stat>") ++missing; else ++wrong;
+            if (wrong + missing <= 20) {
+                logf("stats debug: index check (%s): %s %s has StatsObjectIndex %d -> %s", when, kindName,
+                     name.c_str(), index, held.c_str());
+            }
+        }
+        logf("stats debug: index check (%s): %zu %s prototypes, %zu point at another stat, %zu at none", when,
+             checked, kindName, wrong, missing);
     }
 }
 

@@ -37,6 +37,8 @@ extern "C" void bg3le_stats_loading(bool loading);
 extern "C" void bg3le_stats_debug_summary(char const* when);
 extern "C" void bg3le_stats_debug_watch(char const* when, bool prototypes);
 extern "C" void bg3le_prototypes_debug_check_spells(char const* when);
+extern "C" void bg3le_prototypes_debug_check_indices(char const* when);
+extern "C" void bg3le_prototypes_debug_candidates(char const* when);
 extern "C" void bg3le_path_override_clear();
 #include "targets.h"
 
@@ -190,6 +192,8 @@ std::uint64_t machine_update_hook(void* machine, void* a, void* b, void* c) {
         if (std::strcmp(now, "UnloadSession") == 0) bg3le_path_override_clear();
         if (std::strcmp(last, "PrepareRunning") == 0 && std::strcmp(now, "Running") == 0) {
             bg3le_prototypes_debug_check_spells("client Running");
+            bg3le_prototypes_debug_check_indices("client Running");
+            bg3le_prototypes_debug_candidates("client Running");
             bg3le_stats_debug_watch("client Running", true);
         }
         if (std::strcmp(now, "UnloadSession") == 0 && note_session_ended()) {
