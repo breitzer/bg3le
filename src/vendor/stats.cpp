@@ -2201,6 +2201,14 @@ std::size_t& conditions_taken() {
     return taken;
 }
 
+// Debug: conditions a mod set that the pool already held.
+std::size_t& conditions_reused() {
+    static std::size_t reused = 0;
+    static std::uint32_t gen = ~0u;
+    clear_on_rebuild(gen, [&] { reused = 0; });
+    return reused;
+}
+
 std::size_t& strings_taken() {
     static std::size_t taken = 0;
     static std::uint32_t gen = ~0u;
@@ -2309,15 +2317,29 @@ extern "C" int bg3le_stats_condition_intern(char const* text) {
         return -1;
     }
 
-    // What has already been written, so the same expression twice costs
-    // nothing. Searching the pool itself instead reads five thousand
-    // Larian strings, most of them through a pointer, and a mod that
-    // writes forty conditions paid for it forty times.
-    static std::unordered_map<std::string, int> ours;
+    // As upstream's GetOrCreateConditions: a slot already holding the text is
+    // reused, the engine's included. The pool is indexed once per load, and
+    // what the engine appends later is picked up from where that left off.
+    static std::unordered_map<std::string, int> pooled;
+    static std::uint32_t indexed = 1;  // slot 0 reads as no condition
     static std::uint32_t gen = ~0u;
-    clear_on_rebuild(gen, [&] { ours.clear(); });
-    auto known = ours.find(text);
-    if (known != ours.end()) return known->second;
+    clear_on_rebuild(gen, [&] { pooled.clear(); indexed = 1; });
+    std::uint64_t buffer = 0;
+    std::uint32_t live = 0;
+    if (read_as(f.ConditionsHeader, &buffer) && read_as((char const*)f.ConditionsHeader + 12, &live)
+        && buffer != 0) {
+        for (; indexed < live; ++indexed) {
+            std::string existing;
+            if (read_ls_string((char const*)(std::uintptr_t)buffer + (std::size_t)indexed * 16, &existing)) {
+                pooled.emplace(std::move(existing), (int)indexed);  // the first holder, as upstream
+            }
+        }
+    }
+    auto known = pooled.find(text);
+    if (known != pooled.end()) {
+        ++conditions_reused();
+        return known->second;
+    }
 
     // The next slot is the array's own size, read live. Adding a count of
     // our writes to a size those writes had already advanced skipped a
@@ -2338,7 +2360,8 @@ extern "C" int bg3le_stats_condition_intern(char const* text) {
     const_cast<ArrayRef&>(f.Conditions).Size = size;
 
     ++conditions_taken();
-    ours.emplace(text, (int)slot);
+    pooled.emplace(text, (int)slot);
+    if (indexed == slot) indexed = size;
     bg3le_stats_attr_condition((int)slot);  // into the read cache too
 
     // Truncated, and quiet after the first few: these run to six hundred
@@ -2375,9 +2398,26 @@ extern "C" void bg3le_stats_debug_summary(char const* when) {
     std::uint32_t conditions = 0;
     if (f.ConditionsHeader != nullptr) read_as((char const*)f.ConditionsHeader + 12, &conditions);
     logf("stats debug: %s: %zu stats (%zu spells, %zu statuses, %zu passives, %zu interrupts); "
-         "condition pool %u, %zu written by bg3le; first object %p; module load %u, generation %u",
+         "condition pool %u, %zu written by bg3le, %zu reused; first object %p; module load %u, generation %u",
          when, (std::size_t)f.Objects.Size, spells, statuses, passives, interrupts, conditions,
-         conditions_taken(), first_object(f), g_module_loads.load(), g_generation);
+         conditions_taken(), conditions_reused(), first_object(f), g_module_loads.load(), g_generation);
+}
+
+// Debug: a condition's text as the pool holds it now, past the read cache.
+extern "C" char const* bg3le_stats_condition_live(int raw) {
+    const CacheLock lock(stats_cache_lock());
+    Found const& f = state();
+    thread_local std::string text;
+    std::uint64_t buffer = 0;
+    std::uint32_t live = 0;
+    if (raw < 0 || f.ConditionsHeader == nullptr || !read_as(f.ConditionsHeader, &buffer)
+        || !read_as((char const*)f.ConditionsHeader + 12, &live) || buffer == 0
+        || (std::uint32_t)raw >= live) {
+        return nullptr;
+    }
+    text.clear();
+    if (!read_ls_string((char const*)(std::uintptr_t)buffer + (std::size_t)raw * 16, &text)) return nullptr;
+    return text.c_str();
 }
 
 // The pool index for a FixedString attribute's text.
@@ -2977,12 +3017,9 @@ extern "C" int bg3le_stats_roll_condition_count(void const* object,
     return size > 4096 ? -1 : (int)size;
 }
 
-extern "C" bool bg3le_stats_roll_condition_at(void const* object,
-                                              char const* attribute,
-                                              int index,
-                                              char const** nameOut,
-                                              char const** textOut) {
-    const CacheLock lock(stats_cache_lock());
+// The n-th roll condition's name id and condition pool index.
+static bool roll_entry(void const* object, char const* attribute, int index,
+                std::uint32_t* name, std::int32_t* condition) {
     const int count = bg3le_stats_roll_condition_count(object, attribute);
     if (count < 0 || index < 0 || index >= count) return false;
 
@@ -3001,11 +3038,26 @@ extern "C" bool bg3le_stats_roll_condition_at(void const* object,
     // RollCondition is { FixedString Name; ConditionId Conditions }, and
     // ConditionId is one int32 indexing the condition pool.
     auto const* entry = (char const*)buffer + (std::size_t)index * 8;
+    return read_as(entry, name) && read_as(entry + 4, condition);
+}
+
+// Debug: the n-th roll condition's pool index, or -1.
+extern "C" int bg3le_stats_roll_condition_raw(void const* object, char const* attribute, int index) {
+    const CacheLock lock(stats_cache_lock());
+    std::uint32_t name = 0;
+    std::int32_t condition = -1;
+    return roll_entry(object, attribute, index, &name, &condition) ? condition : -1;
+}
+
+extern "C" bool bg3le_stats_roll_condition_at(void const* object,
+                                              char const* attribute,
+                                              int index,
+                                              char const** nameOut,
+                                              char const** textOut) {
+    const CacheLock lock(stats_cache_lock());
     std::uint32_t name = 0;
     std::int32_t condition = 0;
-    if (!read_as(entry, &name) || !read_as(entry + 4, &condition)) {
-        return false;
-    }
+    if (!roll_entry(object, attribute, index, &name, &condition)) return false;
 
     if (nameOut != nullptr) {
         char const* text = bg3le_fixed_string(name, nullptr);

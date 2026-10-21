@@ -15,11 +15,18 @@
 #include <GameDefinitions/Stats/Stats.h>
 #include <GameDefinitions/Stats/Prototype.h>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "../log.h"
 #include "../resolve.h"
@@ -592,4 +599,191 @@ extern "C" void bg3le_prototypes_debug_check_passives(void const* mapAt, char co
     }
     logf("stats debug: passive check (%s): %zu passives, %zu condition indices differ from the stat's, "
          "%zu of them in text", when, checked, indexDiffers, textDiffers);
+}
+
+extern "C" char const* bg3le_stats_condition_live(int raw);
+extern "C" int bg3le_stats_roll_condition_count(void const* object, char const* attribute);
+extern "C" int bg3le_stats_roll_condition_raw(void const* object, char const* attribute, int index);
+extern "C" std::size_t bg3le_prototype_count(int kind);
+extern "C" char const* bg3le_prototype_name_at(int kind, std::size_t index);
+
+namespace bg3le {
+namespace {
+
+static_assert(sizeof(SpellMetaCondition) == 8);
+
+std::string live_text(int raw) {
+    if (raw <= 0) return "";
+    char const* text = bg3le_stats_condition_live(raw);
+    return text != nullptr ? text : "<past the pool>";
+}
+
+// SpellPrototype::MetaConditions as (type, pool index) pairs, read safely.
+bool proto_meta(void const* proto, std::vector<std::pair<std::uint8_t, int>>* out) {
+    auto const* map = (char const*)proto + offsetof(SpellPrototype, MetaConditions);
+    char const* keys = nullptr;
+    char const* values = nullptr;
+    std::uint32_t count = 0;
+    if (!safe_read(map + 32, &keys, sizeof(keys)) || !safe_read(map + 44, &count, sizeof(count))
+        || !safe_read(map + 48, &values, sizeof(values)) || count > 64
+        || (count != 0 && (keys == nullptr || values == nullptr))) {
+        return false;
+    }
+    for (std::uint32_t i = 0; i < count; ++i) {
+        std::uint8_t type = 0;
+        struct { char const* Buffer; std::uint32_t Capacity; std::uint32_t Size; } array{};
+        if (!safe_read(keys + i, &type, sizeof(type)) || !safe_read(values + i * 16, &array, sizeof(array))
+            || array.Size > 64) {
+            return false;
+        }
+        for (std::uint32_t j = 0; j < array.Size; ++j) {
+            std::int32_t condition = -1;
+            if (!safe_read(array.Buffer + j * sizeof(SpellMetaCondition), &condition, sizeof(condition))) return false;
+            out->emplace_back(type, condition);
+        }
+    }
+    return true;
+}
+
+std::string describe(std::vector<int> const& ids) {
+    if (ids.empty()) return "none";
+    std::string out;
+    char line[160];
+    for (int id : ids) {
+        std::snprintf(line, sizeof(line), "%s#%d \"%.100s\"", out.empty() ? "" : ", ", id, live_text(id).c_str());
+        out += line;
+    }
+    return out;
+}
+
+std::int32_t read_condition(void const* proto, std::size_t at) {
+    std::int32_t raw = -1;
+    return proto != nullptr && safe_read((char const*)proto + at, &raw, sizeof(raw)) ? raw : -1;
+}
+
+void watch_one(std::string const& name, char const* when, bool prototypes) {
+    void const* object = bg3le_stats_find(name.c_str());
+    if (object == nullptr) {
+        logf("stats debug: watch (%s) %s: no such stat", when, name.c_str());
+        return;
+    }
+    char const* type = bg3le_stats_type(object);
+    type = type != nullptr ? type : "?";
+
+    // Every condition the stat holds, from the pool now and from bg3le's read cache.
+    for (std::size_t i = 0;; ++i) {
+        char const* attr = nullptr;
+        char const* typeName = nullptr;
+        int kind = 0;
+        int raw = -1;
+        if (!bg3le_stats_attr_at(object, i, &attr, &typeName, &kind, &raw)) break;
+        if (attr == nullptr || typeName == nullptr) continue;
+        const bool rolls = std::strcmp(typeName, "RollConditions") == 0;
+        const bool condition = !rolls && (std::strstr(typeName, "Conditions") != nullptr
+                                          || std::strstr(attr, "Conditions") != nullptr);
+        if (condition && raw > 0) {
+            char const* cached = bg3le_stats_attr_condition(raw);
+            const std::string live = live_text(raw);
+            logf("stats debug: watch (%s) %s %s.%s = #%d \"%.200s\"%s", when, type, name.c_str(), attr, raw,
+                 live.c_str(), cached != nullptr && live == cached ? "" : " (bg3le's read cache differs)");
+        } else if (rolls) {
+            std::vector<int> ids;
+            for (int r = 0, n = bg3le_stats_roll_condition_count(object, attr); r < n; ++r) {
+                ids.push_back(bg3le_stats_roll_condition_raw(object, attr, r));
+            }
+            if (!ids.empty()) {
+                logf("stats debug: watch (%s) %s %s.%s = %s", when, type, name.c_str(), attr, describe(ids).c_str());
+            }
+        }
+    }
+
+    if (!prototypes) return;
+
+    if (std::strcmp(type, "SpellData") == 0) {
+        void const* proto = bg3le_prototype_find(0, name.c_str());
+        std::vector<std::pair<std::uint8_t, int>> meta;
+        if (proto == nullptr || !proto_meta(proto, &meta)) {
+            logf("stats debug: watch (%s) %s: no spell prototype to read", when, name.c_str());
+            return;
+        }
+        for (auto const& entry : meta) {
+            logf("stats debug: watch (%s) %s prototype meta type %u = #%d \"%.200s\"", when, name.c_str(),
+                 (unsigned)entry.first, entry.second, live_text(entry.second).c_str());
+        }
+        if (meta.empty()) logf("stats debug: watch (%s) %s prototype has no meta conditions", when, name.c_str());
+    } else if (std::strcmp(type, "PassiveData") == 0) {
+        void const* proto = bg3le_prototype_find(3, name.c_str());
+        const int conditions = read_condition(proto, offsetof(PassivePrototype, ConditionsIndex));
+        const int boost = read_condition(proto, offsetof(PassivePrototype, BoostConditionsIndex));
+        logf("stats debug: watch (%s) %s prototype%s: Conditions #%d \"%.200s\", BoostConditions #%d \"%.200s\"",
+             when, name.c_str(), proto == nullptr ? " not found" : "", conditions, live_text(conditions).c_str(),
+             boost, live_text(boost).c_str());
+    } else if (std::strcmp(type, "InterruptData") == 0) {
+        void const* proto = bg3le_prototype_find(2, name.c_str());
+        const int conditions = read_condition(proto, offsetof(InterruptPrototype, Conditions));
+        const int roll = read_condition(proto, offsetof(InterruptPrototype, RollCondition));
+        const int enable = read_condition(proto, offsetof(InterruptPrototype, EnableCondition));
+        logf("stats debug: watch (%s) %s prototype%s: Conditions #%d \"%.200s\", Roll #%d \"%.200s\", "
+             "EnableCondition #%d \"%.200s\"", when, name.c_str(), proto == nullptr ? " not found" : "",
+             conditions, live_text(conditions).c_str(), roll, live_text(roll).c_str(), enable,
+             live_text(enable).c_str());
+    }
+}
+
+}  // namespace
+}  // namespace bg3le
+
+// Debug: the conditions spell prototypes carry. MetaConditions holds the engine's
+// global checks, not the stat's own; those are read from the stat when used.
+// Every distinct (type, slot) is listed with how many spells use it.
+extern "C" void bg3le_prototypes_debug_check_spells(char const* when) {
+    using namespace bg3le;
+    const auto started = std::chrono::steady_clock::now();
+    std::size_t checked = 0, unread = 0;
+    std::map<std::pair<std::uint8_t, int>, std::size_t> uses;
+    for (std::size_t i = 0, n = bg3le_prototype_count(0); i < n; ++i) {
+        char const* at = bg3le_prototype_name_at(0, i);
+        if (at == nullptr) continue;
+        const std::string name = at;
+        void const* proto = bg3le_prototype_find(0, name.c_str());
+        if (proto == nullptr) continue;
+        std::vector<std::pair<std::uint8_t, int>> meta;
+        if (!proto_meta(proto, &meta)) {
+            ++unread;
+            continue;
+        }
+        ++checked;
+        for (auto const& entry : meta) ++uses[entry];
+    }
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
+    logf("stats debug: spell check (%s): %zu spell prototypes (%zu unreadable) use %zu distinct meta conditions "
+         "(%lld ms)", when, checked, unread, uses.size(), (long long)ms.count());
+    std::size_t said = 0;
+    for (auto const& [key, count] : uses) {
+        if (++said > 40) break;
+        logf("stats debug: spell check (%s): meta type %u #%d used by %zu: \"%.120s\"", when, (unsigned)key.first,
+             key.second, count, live_text(key.second).c_str());
+    }
+}
+
+// Debug: the conditions of a few stats, and of their prototypes when `prototypes`
+// is set. BG3LE_DEBUG_WATCH adds names, separated by commas.
+extern "C" void bg3le_stats_debug_watch(char const* when, bool prototypes) {
+    using namespace bg3le;
+    std::vector<std::string> names = {"Target_MainHandAttack", "Target_UnarmedAttack", "Target_Hex",
+                                      "Shout_ArmorOfAgathys", "Hex", "ArmorOfAgathys", "ArmorOfAgathys_2",
+                                      "ARMOR_OF_AGATHYS"};
+    if (char const* extra = std::getenv("BG3LE_DEBUG_WATCH")) {
+        std::string list = extra;
+        for (std::size_t at = 0; at < list.size();) {
+            std::size_t end = list.find(',', at);
+            if (end == std::string::npos) end = list.size();
+            std::string name = list.substr(at, end - at);
+            name.erase(0, name.find_first_not_of(' '));
+            name.erase(name.find_last_not_of(' ') + 1);
+            if (!name.empty()) names.push_back(name);
+            at = end + 1;
+        }
+    }
+    for (auto const& name : names) watch_one(name, when, prototypes);
 }

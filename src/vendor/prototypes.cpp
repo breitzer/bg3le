@@ -53,6 +53,8 @@ extern "C" bool bg3le_static_record_path(char const* key, void const* target,
                                          std::uint64_t first_window);
 extern "C" bool bg3le_stats_is_loading();
 extern "C" void bg3le_prototypes_debug_check_passives(void const* mapAt, char const* when);
+extern "C" void bg3le_prototypes_debug_check_spells(char const* when);
+extern "C" void bg3le_stats_debug_watch(char const* when, bool prototypes);
 
 namespace {
 
@@ -550,6 +552,10 @@ void publish(std::size_t k, Table&& table) {
         state().Ready[k].store(true, std::memory_order_release);
     }
     if (k == kPassive) bg3le_prototypes_debug_check_passives(mapAt, "first found");
+    if (all_ready()) {
+        bg3le_prototypes_debug_check_spells("all prototypes found");
+        bg3le_stats_debug_watch("all prototypes found", true);
+    }
 }
 
 // What a recorded manager holds now, for the log when it is not usable yet.
@@ -880,8 +886,9 @@ bool build() {
     std::size_t total = 0;
     for (auto const& table : found.Kinds) total += table.ByName.size();
     if (total == 0) {
-        logf("prototypes: no prototype manager found; the cached prototype "
-             "getters stay unavailable");
+        logf("prototypes: this scan found no prototype manager (game state %s); "
+             "they are looked for again on the next lookup",
+             client_game_state_or_unknown());
         return false;
     }
 

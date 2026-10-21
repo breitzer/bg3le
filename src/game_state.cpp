@@ -35,6 +35,8 @@ extern "C" void bg3le_templates_invalidate();
 extern "C" void bg3le_stats_load_hooked();
 extern "C" void bg3le_stats_loading(bool loading);
 extern "C" void bg3le_stats_debug_summary(char const* when);
+extern "C" void bg3le_stats_debug_watch(char const* when, bool prototypes);
+extern "C" void bg3le_prototypes_debug_check_spells(char const* when);
 extern "C" void bg3le_path_override_clear();
 #include "targets.h"
 
@@ -186,6 +188,10 @@ std::uint64_t machine_update_hook(void* machine, void* a, void* b, void* c) {
         // LoadSession, which is the story work here.
         // Upstream's client ResetExtensionState drops the path overrides here.
         if (std::strcmp(now, "UnloadSession") == 0) bg3le_path_override_clear();
+        if (std::strcmp(last, "PrepareRunning") == 0 && std::strcmp(now, "Running") == 0) {
+            bg3le_prototypes_debug_check_spells("client Running");
+            bg3le_stats_debug_watch("client Running", true);
+        }
         if (std::strcmp(now, "UnloadSession") == 0 && note_session_ended()) {
             logf("gamestate: session unloaded; rebuilding the Lua states");
             lua_reset(false);
@@ -254,6 +260,7 @@ std::uint64_t stats_load_hook(void* paths, void* a, void* b, void* c) {
     bg3le_stats_debug_summary("before StatsLoaded");
     lua_stats_loaded();
     bg3le_stats_debug_summary("after StatsLoaded");
+    bg3le_stats_debug_watch("after StatsLoaded", false);
     bg3le_stats_loading(false);
     return result;
 }
