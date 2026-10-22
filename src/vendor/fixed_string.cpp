@@ -31,6 +31,7 @@
 
 #include <CoreLib/Base/BaseString.h>
 
+#include <chrono>
 #include <cstdio>
 #include <utility>
 #include <algorithm>
@@ -72,6 +73,7 @@ static_assert(offsetof(SubTable, EntrySize) < offsetof(SubTable, CriticalSection
 static_assert(offsetof(SubTable, EntriesPerBucket) < offsetof(SubTable, CriticalSection));
 static_assert(offsetof(SubTable, NumBuckets) < offsetof(SubTable, CriticalSection));
 static_assert(offsetof(SubTable, Buckets) < offsetof(SubTable, CriticalSection));
+static_assert(offsetof(SubTable, field_1100) == 0x1100 && offsetof(SubTable, field_1180) == 0x1180);
 static_assert(offsetof(SubTable, CriticalSection) < kSubTableStride,
               "the stride has to leave room for everything before it");
 
@@ -389,18 +391,36 @@ std::uint64_t table_extent(void const* table) {
     return extent;
 }
 
-TextIndex const& text_index() {
+// What the extent misses: a string added to a bucket the engine already has.
+// field_1100 counts a sub-table's entries in use and field_1180 moves with it;
+// "Epic" arriving that way left the stats unfound for a whole load.
+std::uint64_t table_usage(void const* table) {
+    std::uint64_t usage = 0;
+    for (std::size_t sub = 0; sub < kSubTableCount; ++sub) {
+        void const* st = sub_table(table, sub);
+        if (!sub_table_plausible(st)) continue;
+        usage = usage * 1000003u + read_at<std::uint32_t>(st, offsetof(SubTable, field_1100));
+        usage = usage * 1000003u + read_at<std::uint64_t>(st, offsetof(SubTable, field_1180));
+    }
+    return usage;
+}
+
+// fresh also rebuilds when strings were added without the table growing.
+TextIndex const& text_index(bool fresh = false) {
     static TextIndex index;
     static std::uint64_t builtFor = 0;
+    static std::uint64_t builtUsage = 0;
 
     void const* table = bg3le_string_table();
     if (table == nullptr) return index;
 
     const std::uint64_t extent = table_extent(table);
-    if (!index.empty() && extent == builtFor) return index;
+    const std::uint64_t usage = fresh ? table_usage(table) : builtUsage;
+    if (!index.empty() && extent == builtFor && usage == builtUsage) return index;
 
     index.clear();
     builtFor = extent;
+    builtUsage = table_usage(table);
 
     // What the walk rejects, and why. The first version of this index
     // collected a fifth of the table and the lookups it was built for
@@ -534,21 +554,36 @@ extern "C" bool bg3le_fixed_string_index_of(char const* wanted,
     const std::size_t wantLen = std::strlen(wanted);
     const std::uint64_t hash = text_hash(wanted, wantLen);
 
-    TextIndex const& index = text_index();
-    auto at = std::lower_bound(
-        index.begin(), index.end(),
-        std::pair<std::uint64_t, std::uint32_t>{hash, 0});
+    auto find = [&](TextIndex const& index) {
+        auto at = std::lower_bound(
+            index.begin(), index.end(),
+            std::pair<std::uint64_t, std::uint32_t>{hash, 0});
+        for (; at != index.end() && at->first == hash; ++at) {
+            std::uint32_t length = 0;
+            char const* text = bg3le_fixed_string(at->second, &length);
+            if (text == nullptr || length != wantLen) continue;
+            if (std::memcmp(text, wanted, wantLen) != 0) continue;
 
-    for (; at != index.end() && at->first == hash; ++at) {
-        std::uint32_t length = 0;
-        char const* text = bg3le_fixed_string(at->second, &length);
-        if (text == nullptr || length != wantLen) continue;
-        if (std::memcmp(text, wanted, wantLen) != 0) continue;
+            if (out != nullptr) *out = at->second;
+            return true;
+        }
+        return false;
+    };
+    if (find(text_index())) return true;
 
-        if (out != nullptr) *out = at->second;
-        return true;
-    }
-    return false;
+    // A miss may be a string added since the build. Rebuilding is a walk of
+    // the whole table, so at most once a second.
+    static std::chrono::steady_clock::time_point lastRetry{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastRetry < std::chrono::seconds(1)) return false;
+    lastRetry = now;
+    return find(text_index(true));
+}
+
+// Rebuilds the index now if strings were added since it was built.
+extern "C" void bg3le_fixed_string_reindex() {
+    const CacheLock lock(string_cache_lock());
+    if (bg3le_string_table() != nullptr) text_index(true);
 }
 
 // The text of a FixedString index, or null. length may be null.

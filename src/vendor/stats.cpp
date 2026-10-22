@@ -108,6 +108,7 @@ char const* text_of(bg3se::FixedString const& fs) {
 extern "C" bool bg3le_fixed_string_index_of(char const* wanted,
                                             std::uint32_t* out);
 extern "C" void bg3le_fixed_string_forget_failures();
+extern "C" void bg3le_fixed_string_reindex();
 extern "C" void bg3le_fixed_string_forget_all();
 extern "C" bool bg3le_meta_format_guid(void const* bytes, char* out,
                                        std::size_t capacity);
@@ -120,7 +121,9 @@ extern "C" bool bg3le_meta_format_guid(void const* bytes, char* out,
 // seconds; this is a plain memory scan.
 bool rarity_indices(std::uint32_t* out) {
     for (std::size_t i = 0; i < kRarityCount; ++i) {
-        if (!bg3le_fixed_string_index_of(kRarities[i], &out[i])) {
+        if (!bg3le_fixed_string_index_of(kRarities[i], &out[i])
+            && (bg3le_fixed_string_reindex(),
+                !bg3le_fixed_string_index_of(kRarities[i], &out[i]))) {
             // Not fatal, and it used to read as though it were: the
             // table is populated as the game loads, and the search runs
             // again later. It succeeds then -- 27,821 stats -- so saying
