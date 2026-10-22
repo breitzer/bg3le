@@ -209,8 +209,9 @@ void load_cache() {
             Entry entry;
             entry.Offset = std::strtoull(field, nullptr, 16);
             entry.Delta = std::strtoull(last + 1, nullptr, 16);
-            for (char* hop = std::strtok(first + 1, ","); hop != nullptr;
-                 hop = std::strtok(nullptr, ",")) {
+            char* rest = nullptr;
+            for (char* hop = strtok_r(first + 1, ",", &rest); hop != nullptr;
+                 hop = strtok_r(nullptr, ",", &rest)) {
                 entry.Hops.push_back(std::strtoull(hop, nullptr, 16));
             }
             entries.push_back(std::move(entry));

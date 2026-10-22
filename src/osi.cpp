@@ -1806,8 +1806,9 @@ bool load_cached_signatures(char const* story,
         entry.Outs = outs;
         entry.OutMask = which;
         if (got == 4) {
-            for (char* at = std::strtok(types, ","); at != nullptr;
-                 at = std::strtok(nullptr, ",")) {
+            char* rest = nullptr;
+            for (char* at = strtok_r(types, ",", &rest); at != nullptr;
+                 at = strtok_r(nullptr, ",", &rest)) {
                 entry.Types.push_back((std::uint8_t)std::strtoul(at, nullptr, 10));
             }
         }
