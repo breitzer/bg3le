@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.3.14 (2026-10-21)
+
+- Stats load in full on every launch. About one launch in three loaded only part of them, anywhere from 2,000 to
+  12,000 of 24,000, and every mod's `StatsLoaded` handler then failed on stats that were missing. The engine's
+  stats parser tokenises with `strtok`, which keeps one position for the whole process, and bg3le called `strtok`
+  on another thread during the load, cutting the parse short. bg3le uses `strtok_r` now.
+- Attacks roll again after loading a save that reloads the stats, when a mod has changed `SpellRoll` on a spell
+  during the main menu's load. bg3le stored the roll's names without taking a reference, as upstream's
+  `FixedString` copy does, and the engine released them when it freed the menu's stats. After that every attack
+  hit, `IsAttack()` and `IsMeleeAttack()` were false, and effects that check them, such as Hex's damage and Armor
+  of Agathys's retaliation, did nothing.
+- The stats are found at the end of the main menu's load even when the engine adds the strings bg3le looks for
+  into its string table's free slots. bg3le's index of that table missed them, the stats search failed, and the
+  mods' `StatsLoaded` handlers ran against no stats.
+- An empty condition is no condition, as upstream's `GetOrCreateConditions` returns, and an empty `SpellRoll`
+  entry is dropped. A condition a mod sets that the engine already holds reuses its slot, as upstream does.
+- `Ext.Stats` `Sync()` works from the start of a session. Each of the engine's prototype managers is kept as soon
+  as it is found, instead of all four having to resolve together, so a launch where the spell manager was not
+  ready could no longer leave `Sync()` failing with "the passive prototype manager is not located".
+- GameThread and the loading threads the engine puts on its core keep their pins; every other engine thread still
+  runs on any core.
+- The overlay uploads its font texture while the game presents, and waits for its own GPU work before the game
+  rebuilds its swapchain.
+- More logging around swapchains, presents, memory, the display environment and thread pinning, for display
+  problems on handhelds and TVs.
+- Building with `tools/build-sniper.sh` no longer needs libc++ on the host (#5, thanks to sashage).
+
 ## v0.3.13 (2026-10-17)
 
 - `Ext.Entity.GetEntitiesAroundPosition` reads the engine's spatial grid, as upstream does, so it returns only the

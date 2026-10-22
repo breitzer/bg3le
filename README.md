@@ -84,7 +84,8 @@ structure was found, and what was measured, is in
 - **Fixes for the native build itself**: level loads from 65–98 s to about
   1 s ([reference/SLOW-LOAD-DIAGNOSIS.md](reference/SLOW-LOAD-DIAGNOSIS.md)),
   an eGPU endgame save from 30 to 71 fps (also usable on its own, see
-  [MEMSTEER.md](MEMSTEER.md)), the engine's thread pinning undone, and mod
+  [MEMSTEER.md](MEMSTEER.md)), the engine's thread pinning undone except on
+  GameThread's core, and mod
   archives corrected for what only Linux trips over (below).
 - **Native plugins**: shared libraries dropped in
   `~/.local/share/bg3le/plugins` load with the game, no launch option
