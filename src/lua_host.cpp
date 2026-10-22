@@ -14151,7 +14151,8 @@ local function stat_write(self, key, value, raw)
     if type(value) ~= "string" then
       error(string.format("%s is a condition expression", key), 3)
     end
-    raw = Ext._Internal.StatsConditionIntern(value)
+    -- "" is no condition, as upstream's GetOrCreateConditions.
+    raw = value == "" and -1 or Ext._Internal.StatsConditionIntern(value)
     if raw == nil then
       error(string.format(
         "bg3le could not add the condition %q to the engine's condition "

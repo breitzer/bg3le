@@ -2312,7 +2312,8 @@ bool pool_slot(void const* header, ArrayRef const& ref, std::size_t stride,
 extern "C" int bg3le_stats_condition_intern(char const* text) {
     const CacheLock lock(stats_cache_lock());
     Found const& f = state();
-    if (text == nullptr || f.Conditions.Buffer == nullptr
+    // "" is no condition, as upstream's GetOrCreateConditions.
+    if (text == nullptr || *text == '\0' || f.Conditions.Buffer == nullptr
         || f.ConditionsHeader == nullptr) {
         return -1;
     }
@@ -2807,23 +2808,23 @@ extern "C" int bg3le_stats_roll_set(void const* object, char const* attribute,
 
     std::vector<std::int32_t> entries;
     for (std::size_t i = 0; i < count; ++i) {
+        // Upstream drops an entry whose condition is empty.
+        if (texts[i] == nullptr || *texts[i] == '\0') continue;
         const int condition = bg3le_stats_condition_intern(texts[i]);
         if (condition < 0) return 2;
+        // A referenced id, as upstream's FixedString copy: the engine releases
+        // it when it frees the stats.
         std::uint32_t name = 0;
-        if (!bg3le_fixed_string_index_of(names[i], &name)
-            && !bg3le_fixed_string_intern(names[i], &name)) {
-            return 3;
-        }
+        if (!bg3le_fixed_string_intern(names[i], &name)) return 3;
         entries.push_back((std::int32_t)name);
         entries.push_back(condition);
     }
+    count = entries.size() / 2;
 
     if (slot < 0) {
         if (count == 0) return 0;
         std::uint32_t key = 0;
-        if (!bg3le_game_allocator_ready()
-            || (!bg3le_fixed_string_index_of(attribute, &key)
-                && !bg3le_fixed_string_intern(attribute, &key))) {
+        if (!bg3le_game_allocator_ready() || !bg3le_fixed_string_intern(attribute, &key)) {
             return 1;
         }
         void* fresh = bg3se::GameAllocRaw(count * 8);
