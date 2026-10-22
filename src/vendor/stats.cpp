@@ -2204,14 +2204,6 @@ std::size_t& conditions_taken() {
     return taken;
 }
 
-// Debug: conditions a mod set that the pool already held.
-std::size_t& conditions_reused() {
-    static std::size_t reused = 0;
-    static std::uint32_t gen = ~0u;
-    clear_on_rebuild(gen, [&] { reused = 0; });
-    return reused;
-}
-
 std::size_t& strings_taken() {
     static std::size_t taken = 0;
     static std::uint32_t gen = ~0u;
@@ -2340,10 +2332,7 @@ extern "C" int bg3le_stats_condition_intern(char const* text) {
         }
     }
     auto known = pooled.find(text);
-    if (known != pooled.end()) {
-        ++conditions_reused();
-        return known->second;
-    }
+    if (known != pooled.end()) return known->second;
 
     // The next slot is the array's own size, read live. Adding a count of
     // our writes to a size those writes had already advanced skipped a
@@ -2377,51 +2366,6 @@ extern "C" int bg3le_stats_condition_intern(char const* text) {
              std::strlen(text) > 64 ? "..." : "");
     }
     return (int)slot;
-}
-
-// Debug: what the stats hold right now, for the StatsLoaded log lines.
-extern "C" void bg3le_stats_debug_summary(char const* when) {
-    const CacheLock lock(stats_cache_lock());
-    if (!ready()) {
-        logf("stats debug: %s: the stats are not found (module load %u, generation %u)", when,
-             g_module_loads.load(), g_generation);
-        return;
-    }
-    Found const& f = state();
-    std::size_t spells = 0, statuses = 0, passives = 0, interrupts = 0;
-    for (std::size_t i = 0; i < f.Objects.Size; ++i) {
-        void const* object = nullptr;
-        if (!read_as((char const*)f.Objects.Buffer + i * sizeof(void*), &object) || object == nullptr) continue;
-        char const* type = bg3le_stats_type(object);
-        if (type == nullptr) continue;
-        if (std::strcmp(type, "SpellData") == 0) ++spells;
-        else if (std::strcmp(type, "StatusData") == 0) ++statuses;
-        else if (std::strcmp(type, "PassiveData") == 0) ++passives;
-        else if (std::strcmp(type, "InterruptData") == 0) ++interrupts;
-    }
-    std::uint32_t conditions = 0;
-    if (f.ConditionsHeader != nullptr) read_as((char const*)f.ConditionsHeader + 12, &conditions);
-    logf("stats debug: %s: %zu stats (%zu spells, %zu statuses, %zu passives, %zu interrupts); "
-         "condition pool %u, %zu written by bg3le, %zu reused; first object %p; module load %u, generation %u",
-         when, (std::size_t)f.Objects.Size, spells, statuses, passives, interrupts, conditions,
-         conditions_taken(), conditions_reused(), first_object(f), g_module_loads.load(), g_generation);
-}
-
-// Debug: a condition's text as the pool holds it now, past the read cache.
-extern "C" char const* bg3le_stats_condition_live(int raw) {
-    const CacheLock lock(stats_cache_lock());
-    Found const& f = state();
-    thread_local std::string text;
-    std::uint64_t buffer = 0;
-    std::uint32_t live = 0;
-    if (raw < 0 || f.ConditionsHeader == nullptr || !read_as(f.ConditionsHeader, &buffer)
-        || !read_as((char const*)f.ConditionsHeader + 12, &live) || buffer == 0
-        || (std::uint32_t)raw >= live) {
-        return nullptr;
-    }
-    text.clear();
-    if (!read_ls_string((char const*)(std::uintptr_t)buffer + (std::size_t)raw * 16, &text)) return nullptr;
-    return text.c_str();
 }
 
 // The pool index for a FixedString attribute's text.

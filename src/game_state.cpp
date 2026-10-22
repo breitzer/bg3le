@@ -12,12 +12,9 @@
 #include "game_state.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
-#include <dlfcn.h>
-#include <execinfo.h>
-#include <iterator>
 #include <mutex>
 #include <pthread.h>
 #include <string>
@@ -34,11 +31,6 @@ extern "C" void bg3le_stats_module_loaded();
 extern "C" void bg3le_templates_invalidate();
 extern "C" void bg3le_stats_load_hooked();
 extern "C" void bg3le_stats_loading(bool loading);
-extern "C" void bg3le_stats_debug_summary(char const* when);
-extern "C" void bg3le_stats_debug_watch(char const* when, bool prototypes);
-extern "C" void bg3le_prototypes_debug_check_spells(char const* when);
-extern "C" void bg3le_prototypes_debug_check_indices(char const* when);
-extern "C" void bg3le_prototypes_debug_candidates(char const* when);
 extern "C" void bg3le_path_override_clear();
 #include "targets.h"
 
@@ -190,12 +182,6 @@ std::uint64_t machine_update_hook(void* machine, void* a, void* b, void* c) {
         // LoadSession, which is the story work here.
         // Upstream's client ResetExtensionState drops the path overrides here.
         if (std::strcmp(now, "UnloadSession") == 0) bg3le_path_override_clear();
-        if (std::strcmp(last, "PrepareRunning") == 0 && std::strcmp(now, "Running") == 0) {
-            bg3le_prototypes_debug_check_spells("client Running");
-            bg3le_prototypes_debug_check_indices("client Running");
-            bg3le_prototypes_debug_candidates("client Running");
-            bg3le_stats_debug_watch("client Running", true);
-        }
         if (std::strcmp(now, "UnloadSession") == 0 && note_session_ended()) {
             logf("gamestate: session unloaded; rebuilding the Lua states");
             lua_reset(false);
@@ -224,29 +210,8 @@ std::uint64_t machine_update_hook(void* machine, void* a, void* b, void* c) {
 using StatsLoadProc = std::uint64_t (*)(void*, void*, void*, void*);
 StatsLoadProc g_stats_load = nullptr;
 
-// Debug: this thread's callers as module+offset, to tell RPGStats::Load's callers apart.
-void log_callers(char const* what) {
-    void* frames[10];
-    const int n = backtrace(frames, (int)std::size(frames));
-    std::string text;
-    for (int i = 1; i < n; ++i) {
-        char one[96];
-        Dl_info info{};
-        if (dladdr(frames[i], &info) != 0 && info.dli_fname != nullptr) {
-            char const* base = std::strrchr(info.dli_fname, '/');
-            std::snprintf(one, sizeof(one), " %s+%#lx", base != nullptr ? base + 1 : info.dli_fname,
-                          (unsigned long)((char*)frames[i] - (char*)info.dli_fbase));
-        } else {
-            std::snprintf(one, sizeof(one), " %p", frames[i]);
-        }
-        text += one;
-    }
-    logf("%s%s", what, text.c_str());
-}
-
 // RPGStats::Load(paths), on the worker the client schedules it on.
 std::uint64_t stats_load_hook(void* paths, void* a, void* b, void* c) {
-    // Debug: which load this is, from where, and what it left.
     static std::atomic<unsigned> loads{0};
     const unsigned load = ++loads;
     char thread[32] = "?";
@@ -255,16 +220,14 @@ std::uint64_t stats_load_hook(void* paths, void* a, void* b, void* c) {
     char const* server = server_game_state();
     logf("stats: RPGStats::Load starts (load #%u on thread %s; client %s, server %s)", load, thread,
          client != nullptr ? client : "unknown", server != nullptr ? server : "unknown");
-    log_callers("stats: RPGStats::Load called from");
     lua_module_load_started();
     bg3le_stats_loading(true);
+    const auto started = std::chrono::steady_clock::now();
     const std::uint64_t result = g_stats_load(paths, a, b, c);
-    logf("stats: RPGStats::Load done (load #%u)", load);
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    logf("stats: RPGStats::Load done (load #%u, %.2f s)", load, secs);
     bg3le_stats_module_loaded();
-    bg3le_stats_debug_summary("before StatsLoaded");
     lua_stats_loaded();
-    bg3le_stats_debug_summary("after StatsLoaded");
-    bg3le_stats_debug_watch("after StatsLoaded", false);
     bg3le_stats_loading(false);
     return result;
 }

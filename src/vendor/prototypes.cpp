@@ -26,7 +26,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -53,11 +52,6 @@ extern "C" void bg3le_static_confirm(char const* key, std::size_t which);
 extern "C" bool bg3le_static_record_path(char const* key, void const* target,
                                          std::uint64_t first_window);
 extern "C" bool bg3le_stats_is_loading();
-extern "C" void bg3le_prototypes_debug_check_passives(void const* mapAt, char const* when);
-extern "C" void bg3le_prototypes_debug_check_spells(char const* when);
-extern "C" void bg3le_prototypes_debug_check_indices(char const* when);
-extern "C" void bg3le_prototypes_debug_candidates(char const* when);
-extern "C" void bg3le_stats_debug_watch(char const* when, bool prototypes);
 
 namespace {
 
@@ -548,19 +542,9 @@ void publish(std::size_t k, Table&& table) {
     table.Order.clear();
     table.Order.reserve(table.ByName.size());
     for (auto const& entry : table.ByName) table.Order.push_back(entry.first);
-    const auto mapAt = (void const*)(std::uintptr_t)table.MapAt;
-    {
-        const std::lock_guard<std::mutex> held(tables_lock());
-        state().Kinds[k] = std::move(table);
-        state().Ready[k].store(true, std::memory_order_release);
-    }
-    if (k == kPassive) bg3le_prototypes_debug_check_passives(mapAt, "first found");
-    if (all_ready()) {
-        bg3le_prototypes_debug_check_spells("all prototypes found");
-        bg3le_prototypes_debug_check_indices("all prototypes found");
-        bg3le_prototypes_debug_candidates("all prototypes found");
-        bg3le_stats_debug_watch("all prototypes found", true);
-    }
+    const std::lock_guard<std::mutex> held(tables_lock());
+    state().Kinds[k] = std::move(table);
+    state().Ready[k].store(true, std::memory_order_release);
 }
 
 // What a recorded manager holds now, for the log when it is not usable yet.
@@ -995,10 +979,6 @@ bool refresh(std::size_t k) {
     logf("prototypes: the engine rebuilt its %s prototypes; read %zu again (was %zu; game state %s)",
          kKinds[k].Name, fresh.ByName.size(), table.ByName.size(), client_game_state_or_unknown());
     table = std::move(fresh);
-    if (k == kPassive) {
-        bg3le_prototypes_debug_check_passives((void const*)(std::uintptr_t)table.MapAt,
-                                              "after the engine rebuilt them");
-    }
     return true;
 }
 
@@ -1110,35 +1090,6 @@ extern "C" char const* bg3le_prototype_name_at(int kind, std::size_t index) {
     thread_local std::string name;
     name = table->Order[index];
     return name.c_str();
-}
-
-// Debug: every distinct manager the recorded paths reach now, to see whether
-// more than one live map of a kind exists and which one bg3le reads.
-extern "C" void bg3le_prototypes_debug_candidates(char const* when) {
-    for (std::size_t k = 0; k < std::size(kKinds); ++k) {
-        unsigned long long inUse = 0;
-        {
-            const std::lock_guard<std::mutex> held(tables_lock());
-            inUse = state().Kinds[k].MapAt;
-        }
-        const std::string key = static_key(k);
-        const std::size_t count = bg3le_static_count(key.c_str());
-        std::map<unsigned long long, std::size_t> seen;
-        for (std::size_t i = 0; i < count; ++i) {
-            void* at = bg3le_static_get(key.c_str(), i);
-            if (at != nullptr) seen.emplace((unsigned long long)(std::uintptr_t)at, i);
-        }
-        logf("prototypes: candidates (%s): %zu recorded %s paths reach %zu distinct maps; bg3le reads %p", when,
-             count, kKinds[k].Name, seen.size(), (void const*)(std::uintptr_t)inUse);
-        std::size_t said = 0;
-        for (auto const& [at, first] : seen) {
-            const std::string what = describe_map(at, k);
-            if (what == "unreadable") continue;
-            if (++said > 20) break;
-            logf("prototypes: candidates (%s): %s map at %p (path %zu): %s%s", when, kKinds[k].Name,
-                 (void const*)(std::uintptr_t)at, first, what.c_str(), at == inUse ? " (in use)" : "");
-        }
-    }
 }
 
 }  // namespace bg3le
