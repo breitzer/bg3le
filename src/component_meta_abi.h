@@ -87,6 +87,9 @@ enum class FieldKind : std::uint8_t {
     EntityOrVec3,
     // BitArray: a table of ElemCount booleans, read and written whole.
     BitArray,
+    // gn::GenomeVariant: a type descriptor and a value, read and written as the
+    // value, as upstream's LuaGetValue and LuaSetValue.
+    GenomeVariant,
 };
 
 struct FieldDesc;
@@ -185,6 +188,10 @@ struct FieldDesc {
     // fresh allocation, abandoning the old buffer rather than freeing it
     // (bg3le cannot know who allocated it). Last, as above.
     bool (*Resize)(void* container, std::size_t count);
+    // Upstream's ordered erase and push_back of a default element, done without
+    // destroying anything: the other elements are relocated into a fresh buffer.
+    bool (*Erase)(void* container, std::size_t index);
+    bool (*Append)(void* container);
     // Map only, for a map whose entries are nodes rather than two contiguous
     // runs (LegacyMap, LegacyRefMap): the value and the key of entry index,
     // used in place of Data and KeyData. Last, as above.

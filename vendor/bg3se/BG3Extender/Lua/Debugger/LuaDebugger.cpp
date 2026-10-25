@@ -284,6 +284,7 @@ namespace bg3se::lua::dbg
         auto closure = clLvalue(ar->i_ci->func);
         auto proto = closure->p;
         auto pc = (int)(ar->i_ci->u.l.savedpc - proto->code) - 1;
+        lua_checkstack(L, proto->sizelocvars + proto->sizeupvalues + 3); // values, closure, chunk, traceback handler
 
         int variableIdx = 1;
         int localIdx = 1;
@@ -304,7 +305,7 @@ namespace bg3se::lua::dbg
         api_incr_top(L);
 
         for (int i = 1; i <= proto->sizeupvalues; i++) {
-            auto name = lua_getupvalue(L, -1, i);
+            auto name = lua_getupvalue(L, funcIdx, i);
             if (name) {
                 locals.push_back(std::make_pair(variableIdx, name));
                 variableIdx++;
@@ -404,7 +405,7 @@ namespace bg3se::lua::dbg
 
         for (auto type : types) {
             entity.PushComponentByType(L, type);
-            if (lua_type(L, 1) != LUA_TNIL) {
+            if (lua_type(L, -1) != LUA_TNIL) {
                 push(L, EnumInfo<ExtComponentType>::Find(type).GetString());
                 LuaElementToEvalResults(L, -1, -2, req);
                 lua_pop(L, 1);

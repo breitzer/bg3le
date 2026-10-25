@@ -10,6 +10,7 @@
 // wins over a packed one the way it does for the engine.
 
 #include <string>
+#include <vector>
 
 namespace bg3le {
 
@@ -26,6 +27,9 @@ bool game_file_read(char const* relative, std::string* out);
 
 // Whether the path exists, without reading it.
 bool game_file_exists(char const* relative);
+
+// Every packed path that starts with prefix, in path order.
+std::vector<std::string> game_files_under(std::string const& prefix);
 
 // A file under Mods/ inside an installed mod's archive (src/ext_libs.cpp).
 bool mod_file_read(char const* relative, std::string* out);

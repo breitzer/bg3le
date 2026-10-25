@@ -10,6 +10,9 @@ void BroadcastMessage(lua_State* L, StringView channel, StringView payload, std:
     esv::Character* excludeCharacter = nullptr;
     if (excludeCharacterGuid) {
         excludeCharacter = State::FromLua(L)->GetEntitySystemHelpers()->GetComponent<esv::Character>(*excludeCharacterGuid);
+        if (!excludeCharacter) {
+            WARN("BroadcastMessage(): Invalid excludeCharacter GUID: %s", excludeCharacterGuid->ToString().c_str());
+        }
     }
 
     auto& networkMgr = gExtender->GetServer().GetNetworkManager();
@@ -18,8 +21,9 @@ void BroadcastMessage(lua_State* L, StringView channel, StringView payload, std:
         && networkMgr.LocalPeerOnly()
         && gExtender->GetConfig().LocalMessagePassing) {
         bg3se::net::LocalMessage msg;
-        BuildMessage(L, msg, ReservedUserId, channel, payload, moduleGuid, requestHandler, replyId, binary.value_or(false));
-        gExtender->GetClient().GetNetworkManager().PushLocalMessage(std::move(msg));
+        if (BuildMessage(L, msg, ReservedUserId, channel, payload, moduleGuid, requestHandler, replyId, binary.value_or(false))) {
+            gExtender->GetClient().GetNetworkManager().PushLocalMessage(std::move(msg));
+        }
     } else {
         auto msg = BuildMessage(L, ReservedUserId, channel, payload, moduleGuid, requestHandler, replyId, binary.value_or(false));
         if (msg != nullptr) {
@@ -39,8 +43,9 @@ void PostMessageToUserInternal(lua_State* L, UserId userId, StringView channel, 
         && (uint32_t)userId.GetPeerId() == 1
         && gExtender->GetConfig().LocalMessagePassing) {
         bg3se::net::LocalMessage msg;
-        BuildMessage(L, msg, userId, channel, payload, moduleGuid, requestHandler, replyId, binary.value_or(false));
-        gExtender->GetClient().GetNetworkManager().PushLocalMessage(std::move(msg));
+        if (BuildMessage(L, msg, userId, channel, payload, moduleGuid, requestHandler, replyId, binary.value_or(false))) {
+            gExtender->GetClient().GetNetworkManager().PushLocalMessage(std::move(msg));
+        }
     } else {
         auto& networkMgr = gExtender->GetServer().GetNetworkManager();
         auto msg = BuildMessage(L, userId, channel, payload, moduleGuid, requestHandler, replyId, binary.value_or(false));
@@ -54,10 +59,13 @@ void PostMessageToClient(lua_State* L, Guid characterGuid, StringView channel, S
     std::optional<FunctionRef> requestHandler, std::optional<RequestId> replyId, std::optional<bool> binary)
 {
     auto character = State::FromLua(L)->GetEntitySystemHelpers()->GetComponent<esv::Character>(characterGuid);
-    if (character == nullptr) return;
+    if (character == nullptr) {
+        OsiError("Attempted to send message to nonexistent character " << characterGuid << " on channel '" << channel << "'!");
+        return;
+    }
 
     if (character->UserID == ReservedUserId) {
-        OsiError("Attempted to send message to character " << characterGuid << " on channel '" << channel << "' that has no user assigned!");
+        OsiError("Attempted to send message to character " << characterGuid << " that has no user assigned on channel '" << channel << "'!");
         return;
     }
 

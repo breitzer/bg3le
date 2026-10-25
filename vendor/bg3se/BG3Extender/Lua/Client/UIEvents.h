@@ -55,6 +55,15 @@ public:
     void OnCommand(lua::PersistentRegistryEntry const& handler, Noesis::BaseCommand* command, Noesis::BaseComponent* parameter);
     void OnPropertyChanged(lua::PersistentRegistryEntry const& handler, Noesis::BaseComponent* object, Noesis::Symbol property);
 
+    void PostUpdateNoesis();
+    bool HasAnyNoesisThreadCallbacks() const;
+    void DeferNoesisThreadCallback(lua::PersistentRegistryEntry&& handler);
+
+    inline bool IsDispatchingOnRenderThread() const
+    {
+        return dispatchingOnRenderThread_;
+    }
+
 private:
     struct DeferredCommand
     {
@@ -73,6 +82,8 @@ private:
     ClientState& state_;
     Array<DeferredCommand> commands_;
     Array<DeferredPropertyChange> propertyChanges_;
+    Array<lua::PersistentRegistryEntry> noesisThreadCallbacks_;
+    bool dispatchingOnRenderThread_{ false };
 };
 
 END_SE()

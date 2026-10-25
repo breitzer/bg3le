@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <dirent.h>
 #include <dlfcn.h>
+#include <fnmatch.h>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -28,6 +29,7 @@
 #include "lauxlib.h"
 #include "lua.h"
 
+#include "debug_server.h"
 #include "game_files.h"
 #include "log.h"
 #include "pak.h"
@@ -76,17 +78,36 @@ std::string data_root() {
     return path.substr(0, bin) + "/Data";
 }
 
+// Upstream's IsSafeRelativePath, its refusals printed as its OsiError does:
+// Windows' illegal filename characters ('*' allowed in a glob), no trailing
+// space or dot, no traversal. Bytes from 0x80 are UTF-8 and pass.
+bool safe_relative(char const* path, bool isGlob, bool allowEmpty) {
+    auto refuse = [](std::string const& text) {
+        debug_server_output(text.c_str(), 2);
+        logf("IO: %s", text.c_str());
+        return false;
+    };
+    const std::string quoted = std::string("'") + path + "'";
+    if (path[0] == '\0') return allowEmpty || refuse("IO path cannot be empty");
+    for (char const* c = path; *c != '\0'; ++c) {
+        if ((unsigned char)*c < 0x20 || std::strchr("<>:\"|?", *c) != nullptr || (*c == '*' && !isGlob)) {
+            return refuse("Illegal character in filename: " + quoted);
+        }
+    }
+    const char last = path[std::strlen(path) - 1];
+    if (last == ' ' || last == '.') return refuse("Path cannot end with space or dot: " + quoted);
+    if (std::strstr(path, "..") != nullptr) return refuse("Path cannot contain traversal: " + quoted);
+    return true;
+}
+
 // Refuses to leave the root it was given: a mod naming "../../.ssh/id_rsa"
 // should not reach it, and upstream's script::LoadExternalFile checks the
 // same way.
 bool resolve_under(std::string const& root, char const* relative,
                    std::string* out) {
-    if (root.empty() || relative == nullptr || relative[0] == '\0') {
+    if (root.empty() || relative == nullptr || !safe_relative(relative, false, false)) {
         return false;
     }
-    if (relative[0] == '/') return false;
-    if (std::strstr(relative, "..") != nullptr) return false;
-
     *out = root + "/" + relative;
     return true;
 }
@@ -130,13 +151,17 @@ extern "C" int bg3le_ext_clock_epoch(lua_State* L) {
     return 1;
 }
 
+// Upstream's std::format("{0:%F} {0:%T}", system_clock::now()): UTC, and the
+// seconds to Windows' 100 ns tick.
 extern "C" int bg3le_ext_clock_time(lua_State* L) {
-    const std::time_t now = std::time(nullptr);
+    timespec ts{};
+    clock_gettime(CLOCK_REALTIME, &ts);
     std::tm parts{};
-    localtime_r(&now, &parts);
+    gmtime_r(&ts.tv_sec, &parts);
 
     char text[64];
-    std::strftime(text, sizeof(text), "%Y-%m-%d %H:%M:%S", &parts);
+    const std::size_t n = std::strftime(text, sizeof(text), "%Y-%m-%d %H:%M:%S", &parts);
+    std::snprintf(text + n, sizeof(text) - n, ".%07ld", ts.tv_nsec / 100);
     lua_pushstring(L, text);
     return 1;
 }
@@ -348,6 +373,88 @@ extern "C" int bg3le_ext_save_file(lua_State* L) {
     std::fclose(f);
 
     lua_pushboolean(L, ok ? 1 : 0);
+    return 1;
+}
+
+namespace {
+
+void collect_files(std::string const& dir, std::string const& prefix, char const* glob,
+                   bool recursive, std::vector<std::string>* out) {
+    DIR* d = opendir(dir.c_str());
+    if (d == nullptr) return;
+    while (dirent* entry = readdir(d)) {
+        const std::string name = entry->d_name;
+        if (name == "." || name == "..") continue;
+        const std::string full = dir + "/" + name;
+        // A symlinked directory is not entered, as a recursive_directory_iterator
+        // does not by default, so a link loop cannot recurse forever.
+        struct stat st{};
+        if (lstat(full.c_str(), &st) != 0) continue;
+        const bool link = S_ISLNK(st.st_mode);
+        if (link && stat(full.c_str(), &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (recursive && !link) collect_files(full, prefix + name + "/", glob, true, out);
+        } else if (fnmatch(glob, name.c_str(), 0) == 0) {
+            out->push_back(prefix + name);
+        }
+    }
+    closedir(d);
+}
+
+}  // namespace
+
+// Ext.IO.FindFiles(path, glob[, context[, recursive[, checkPackedFiles]]]),
+// upstream's script::FindFiles: files under the root's path matching glob,
+// named relative to that path. "user" is the profile root, not Script Extender.
+extern "C" int bg3le_ext_find_files(lua_State* L) {
+    char const* relative = luaL_checkstring(L, 1);
+    char const* glob = luaL_checkstring(L, 2);
+    char const* context = lua_isnoneornil(L, 3) ? "user" : luaL_checkstring(L, 3);
+    const bool recursive = lua_toboolean(L, 4) != 0;
+    const bool packed = lua_isnoneornil(L, 5) || lua_toboolean(L, 5) != 0;
+
+    std::string root;
+    if (std::strcmp(context, "user") == 0) {
+        root = profile_root();
+    } else if (std::strcmp(context, "data") == 0) {
+        root = data_root();
+    } else {
+        return luaL_error(L, "Unknown file loading context: %s", context);
+    }
+
+    lua_newtable(L);
+    // Upstream's checks: an empty path is the root of the user context only.
+    if (root.empty() || !safe_relative(relative, false, std::strcmp(context, "user") == 0)
+        || !safe_relative(glob, true, false)) {
+        return 1;
+    }
+    std::string base(relative);
+    while (!base.empty() && base.back() == '/') base.pop_back();
+    while (!base.empty() && base.front() == '/') base.erase(0, 1);
+
+    std::vector<std::string> names;
+    collect_files(base.empty() ? root : root + "/" + base, "", glob, recursive, &names);
+    if (packed && std::strcmp(context, "data") == 0) {
+        // The engine's file system has the mods' archives and the game's own mounted.
+        const std::string prefix = base.empty() ? std::string() : base + "/";
+        auto consider = [&](std::string const& name) {
+            if (name.compare(0, prefix.size(), prefix) != 0) return;
+            const std::string rest = name.substr(prefix.size());
+            const std::size_t slash = rest.rfind('/');
+            if (slash != std::string::npos && !recursive) return;
+            const std::string file = slash == std::string::npos ? rest : rest.substr(slash + 1);
+            if (fnmatch(glob, file.c_str(), 0) == 0) names.push_back(rest);
+        };
+        scan_mod_archives();
+        for (auto const& entry : mod_files()) consider(entry.first);
+        for (std::string const& name : bg3le::game_files_under(prefix)) consider(name);
+    }
+    std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        lua_pushlstring(L, names[i].data(), names[i].size());
+        lua_rawseti(L, -2, (lua_Integer)i + 1);
+    }
     return 1;
 }
 

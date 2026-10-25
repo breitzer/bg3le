@@ -693,7 +693,8 @@ std::vector<ComponentEvent>& event_queue() {
 void queue_event(std::uint16_t type, std::uint64_t entity, std::uint64_t world,
                  std::uint8_t kind) {
     static std::atomic<int> said{0};
-    if (said.fetch_add(1) < 3) {
+    static std::atomic<int> saidOneFrame{0};
+    if (said.fetch_add(1) < 3 || ((type & 0x8000) != 0 && saidOneFrame.fetch_add(1) < 3)) {
         bg3le::logf("component events: %s of type %u for %#llx on thread %lu",
                     kind == 1 ? "construct" : "destroy", type,
                     (unsigned long long)entity, (unsigned long)pthread_self());
@@ -812,8 +813,11 @@ extern "C" bool bg3le_component_events_watch(void* container,
     auto* world = container ? world_from_container(container) : nullptr;
     if (world == nullptr) return false;
     auto& registry = world->ComponentCallbacks;
-    if (componentIndex >= registry.Callbacks.size()) return false;
-    auto* callbacks = registry.Callbacks[componentIndex];
+    // Upstream's SparseHashMapHash: one-frame types (0x8000) follow the others.
+    const std::uint32_t slot = (componentIndex & 0x7fffu)
+                               + (componentIndex >> 15) * bg3se::ecs::ComponentMapSize;
+    if (slot >= registry.Callbacks.size()) return false;
+    auto* callbacks = registry.Callbacks[slot];
     if (callbacks == nullptr) return false;
 
     const std::uint16_t type = componentIndex;
@@ -827,7 +831,7 @@ extern "C" bool bg3le_component_events_watch(void* container,
         && !add_connection(callbacks->OnDestroy, component_handler<2>(type))) {
         return false;
     }
-    bg3le::logf("component events: watching type %u in world %p", componentIndex,
+    bg3le::logf("component events: watching type %u (slot %u) in world %p", componentIndex, slot,
                 (void*)world);
     return true;
 }
@@ -916,9 +920,11 @@ extern "C" void bg3le_component_callbacks_probe(void* container,
     auto& registry = world->ComponentCallbacks;
     bg3le::logf("callbacks probe: registry holds %u entries (capacity %u)",
                 registry.Callbacks.size(), registry.Callbacks.capacity());
-    if (componentIndex >= registry.Callbacks.size()) return;
-    auto* cb = registry.Callbacks[componentIndex];
-    bg3le::logf("callbacks probe: type %u -> %p", componentIndex, (void*)cb);
+    const std::uint32_t slot = (componentIndex & 0x7fffu)
+                               + (componentIndex >> 15) * bg3se::ecs::ComponentMapSize;
+    if (slot >= registry.Callbacks.size()) return;
+    auto* cb = registry.Callbacks[slot];
+    bg3le::logf("callbacks probe: type %u (slot %u) -> %p", componentIndex, slot, (void*)cb);
     if (cb == nullptr) return;
 
     auto dump = [](char const* which, bg3se::ecs::ComponentSignal const& sig) {
@@ -1084,6 +1090,19 @@ extern "C" std::uint64_t bg3le_entity_create(void* container) {
 // Upstream's CreateComponentRaw (deferred, through the thread's command
 // buffer) or CreateComponentImmediateRaw (the immediate cache): the slot the
 // component goes in, which for a proxy holds a pointer to it.
+// The engine's own destructor for a type, from its ComponentRegistry_, else
+// bg3le's. A frame's ECB storage keeps the destructor it was made with and
+// destroys the engine's components of that type too, so it must be the engine's.
+void* engine_dtor(bg3se::ecs::EntityWorld* world, std::uint16_t type, void* fallback) {
+    auto const& registry = world->ComponentRegistry_;
+    const std::uint32_t slot = (type & 0x7fffu) + (type >> 15) * bg3se::ecs::ComponentMapSize;
+    if (slot < registry.Bitmask.Size && registry.Bitmask[slot] && slot < registry.Types.size()
+        && registry.Types[slot].DtorProc != nullptr) {
+        return registry.Types[slot].DtorProc;
+    }
+    return fallback;
+}
+
 extern "C" void* bg3le_entity_component_add(void* container, std::uint64_t handle,
                                             std::uint16_t type, std::uint16_t inlineSize,
                                             void* dtor, bool immediate) {
@@ -1096,7 +1115,18 @@ extern "C" void* bg3le_entity_component_add(void* container, std::uint64_t handl
         return world->Cache != nullptr && world->Cache->PrepareAddComponent(entity, typeId, slot) ? slot : nullptr;
     }
     bg3se::ecs::ComponentFrameStorageIndex index;
-    return world->Deferred()->CreateComponentRaw(entity, typeId, inlineSize, index, dtor);
+    return world->Deferred()->CreateComponentRaw(entity, typeId, inlineSize, index,
+                                                 engine_dtor(world, type, dtor));
+}
+
+// Upstream's CreateComponentImmediateRaw ends with this since v33: the type's
+// OnConstruct callbacks, which OnCreate subscriptions hang off.
+extern "C" void bg3le_entity_component_finalize(void* container, std::uint64_t handle,
+                                                std::uint16_t type, void* slot) {
+    auto* world = bg3le::world_from_container(container);
+    if (world == nullptr || world->Cache == nullptr || slot == nullptr) return;
+    world->Cache->FinalizeAddComponent(bg3se::EntityHandle{handle},
+                                       bg3se::ecs::ComponentTypeIndex{type}, slot);
 }
 
 // Upstream's RemoveComponent and RemoveComponentImmediate.
@@ -1108,7 +1138,13 @@ extern "C" bool bg3le_entity_component_remove(void* container, std::uint64_t han
     const bg3se::EntityHandle entity{handle};
     const bg3se::ecs::ComponentTypeIndex typeId{type};
     if (immediate) return world->Cache != nullptr && world->Cache->RemoveComponent(entity, typeId);
-    world->Deferred()->RemoveComponent(entity, typeId, inlineSize, dtor);
+    // As upstream's since v33: through the ECB, a component the entity lacks, or
+    // one on an entity still in the buffer, crashes.
+    auto storage = world->GetEntityStorage(entity);
+    if (!storage || storage->ComponentTypeToIndex.find(typeId) == storage->ComponentTypeToIndex.end()) {
+        return false;
+    }
+    world->Deferred()->RemoveComponent(entity, typeId, inlineSize, engine_dtor(world, type, dtor));
     return true;
 }
 

@@ -16,6 +16,7 @@
 #include <dlfcn.h>
 #include <link.h>
 #include <optional>
+#include <unordered_set>
 #include <string>
 #include <utility>
 
@@ -33,6 +34,7 @@
 #include "targets.h"
 #include "vendor/ls_string.h"
 #include "vendor/mods.h"
+#include "version.h"
 
 // Norbyte's Lua fork is compiled as C++, as bg3se compiles it, so these must
 // not be wrapped in extern "C" or the symbols will not match.
@@ -215,6 +217,51 @@ private:
     lua_State* state_;
 };
 
+bool entity_proxy_handle(lua_State* L, int index, std::uint64_t* handle);
+
+// Upstream's GetDebugName, as Ext.Types.GetValueType: "Entity", an enum's or
+// bitfield's name, an object's or container's type name, else Lua's type name.
+// The name is left on the stack, for the luaL_error that follows.
+char const* osi_debug_name(lua_State* L, int idx) {
+    idx = lua_absindex(L, idx);
+    std::uint64_t handle = 0;
+    if (lua_type(L, idx) == LUA_TUSERDATA && entity_proxy_handle(L, idx, &handle)) return "Entity";
+    if ((lua_type(L, idx) == LUA_TUSERDATA || lua_type(L, idx) == LUA_TTABLE) && lua_getmetatable(L, idx)) {
+        for (char const* field : {"__bg3leEnumName", "__bg3leBitfieldName", "__name"}) {
+            if (lua_getfield(L, -1, field) == LUA_TSTRING && std::strcmp(lua_tostring(L, -1), "EntityProxy") != 0) {
+                return lua_tostring(L, -1);
+            }
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 1);
+    }
+    return luaL_typename(L, idx);
+}
+
+// Upstream's LuaToOsi checks over the inputs, in declared order from stack index
+// first: a number (or an entity, as its handle) for a number type, a string for
+// a string or GUID one; 0, unresolved, is left alone. Numbered from 2, as
+// upstream's are: its function object is argument 1.
+void osi_check_inputs(lua_State* L, int first, std::vector<std::uint16_t> const& bases) {
+    for (std::size_t i = 0; i < bases.size(); ++i) {
+        const int at = first + (int)i;
+        const int shown = (int)i + 2;
+        const int type = lua_type(L, at);
+        std::uint64_t handle = 0;
+        if (bases[i] == osi::kString || bases[i] == osi::kGuidString) {
+            if (type != LUA_TSTRING) {
+                luaL_error(L, "String expected for argument %d, got %s", shown, osi_debug_name(L, at));
+            }
+        } else if (bases[i] == osi::kInteger || bases[i] == osi::kInteger64) {
+            if (type != LUA_TNUMBER && !entity_proxy_handle(L, at, &handle)) {
+                luaL_error(L, "Number expected for argument %d, got %s", shown, osi_debug_name(L, at));
+            }
+        } else if (bases[i] == osi::kReal && type != LUA_TNUMBER) {
+            luaL_error(L, "Number expected for argument %d, got %s", shown, osi_debug_name(L, at));
+        }
+    }
+}
+
 bool to_value(lua_State* L, int idx, osi::Value* out) {
     switch (lua_type(L, idx)) {
         case LUA_TSTRING:
@@ -231,6 +278,14 @@ bool to_value(lua_State* L, int idx, osi::Value* out) {
             out->type = lua_isinteger(L, idx) ? osi::kInteger : osi::kReal;
             if (lua_isinteger(L, idx)) out->integer = lua_tointeger(L, idx);
             return true;
+        case LUA_TUSERDATA: {
+            // An entity is its handle, as upstream's LuaToInt takes one.
+            std::uint64_t handle = 0;
+            if (!entity_proxy_handle(L, idx, &handle)) return false;
+            out->type = osi::kInteger64;
+            out->integer = (std::int64_t)handle;
+            return true;
+        }
         default:
             return false;
     }
@@ -238,6 +293,7 @@ bool to_value(lua_State* L, int idx, osi::Value* out) {
 
 void push_value(lua_State* L, const osi::Value& v) {
     switch (v.type) {
+        case osi::kNone: lua_pushnil(L); break;
         case osi::kString:
         case osi::kGuidString: lua_pushstring(L, v.text.c_str()); break;
         case osi::kReal: lua_pushnumber(L, v.real); break;
@@ -257,6 +313,13 @@ int osi_story_dispatch(lua_State* L) {
     const bool method = lua_toboolean(L, lua_upvalueindex(2)) != 0;
     const int first = method ? 2 : 1;
     const int argc = lua_gettop(L) - first + 1;
+
+    std::vector<std::uint16_t> bases;
+    if (!osi::declared_inputs(name, (std::size_t)(argc > 0 ? argc : 0), &bases)) {
+        return luaL_error(L, "No function named '%s' exists that can be called with %d parameters.",
+                          name, argc);
+    }
+    osi_check_inputs(L, first, bases);
 
     std::vector<osi::Value> args;
     args.reserve(argc > 0 ? argc : 0);
@@ -284,6 +347,13 @@ int osi_story_query(lua_State* L) {
     char const* name = lua_tostring(L, lua_upvalueindex(1));
     const int argc = lua_gettop(L);
 
+    std::vector<std::uint16_t> bases;
+    if (!osi::declared_inputs(name, (std::size_t)argc, &bases)) {
+        return luaL_error(L, "No function named '%s' exists that can be called with %d parameters.",
+                          name, argc);
+    }
+    osi_check_inputs(L, 1, bases);
+
     std::vector<osi::Value> args;
     args.reserve(argc);
     for (int i = 1; i <= argc; ++i) {
@@ -305,6 +375,7 @@ int osi_story_query(lua_State* L) {
         lua_pushboolean(L, status == osi::Status::kHandled);
         return 1;
     }
+    lua_checkstack(L, (int)outputs.size() + 1);
     for (osi::Value const& v : outputs) {
         if (v.type == osi::kNone) {
             lua_pushnil(L);
@@ -324,11 +395,11 @@ bool row_matches(lua_State* L, int first, std::vector<osi::Value> const& row) {
         const int idx = first + (int)i;
         if (idx > lua_gettop(L) || lua_isnil(L, idx)) continue;
 
+        // Typed as upstream's MatchTuple reads them since v33: the wrong type raises.
         switch (row[i].type) {
         case osi::kString:
         case osi::kGuidString: {
-            char const* want = lua_tostring(L, idx);
-            if (want == nullptr) return false;
+            char const* want = luaL_checkstring(L, idx);
             std::string const& held = row[i].text;
             const std::size_t wantLen = std::strlen(want);
             if (wantLen >= 36 && held.size() >= 36) {
@@ -342,12 +413,12 @@ bool row_matches(lua_State* L, int first, std::vector<osi::Value> const& row) {
             break;
         }
         case osi::kReal:
-            if (std::fabs(row[i].real - lua_tonumber(L, idx)) > 0.00001) {
+            if (std::fabs(row[i].real - luaL_checknumber(L, idx)) > 0.00001) {
                 return false;
             }
             break;
         default:
-            if (row[i].integer != lua_tointeger(L, idx)) return false;
+            if (row[i].integer != luaL_checkinteger(L, idx)) return false;
             break;
         }
     }
@@ -416,7 +487,10 @@ int osi_db_delete(lua_State* L) {
 // unwinding out of here would unwind through Osiris.
 void osiris_trigger(char const* name, std::size_t arity, char const* event,
                     std::vector<osi::Value> const& values) {
-    if (g_lua == nullptr) return;
+    // The story thread's call, into the server state under its lock, as
+    // upstream's LuaServerPin.
+    InContext server(Side::Server);
+    if (!server) return;
 
     lua_getglobal(g_lua, "Ext");
     if (!lua_istable(g_lua, -1)) {
@@ -432,6 +506,8 @@ void osiris_trigger(char const* name, std::size_t arity, char const* event,
         return;
     }
 
+    // Room for every argument, as upstream's handlers check since v33.
+    lua_checkstack(g_lua, 3 + (int)values.size() + 1);
     lua_pushstring(g_lua, name);
     lua_pushinteger(g_lua, (lua_Integer)arity);
     lua_pushstring(g_lua, event);
@@ -882,14 +958,16 @@ int osi_story_lookup(lua_State* L) {
     if (isQuery) {
         lua_pushstring(L, name);
         lua_pushcclosure(L, osi_story_query, 1);
-        return 1;
+        lua_pushstring(L, name);
+        return 2;
     }
 
     if (!isDatabase) {
         lua_pushstring(L, name);
         lua_pushboolean(L, 0);
         lua_pushcclosure(L, osi_story_dispatch, 2);
-        return 1;
+        lua_pushstring(L, name);
+        return 2;
     }
 
     // A database reads as well as writes: DB_Foo(...) inserts,
@@ -908,6 +986,25 @@ int osi_story_lookup(lua_State* L) {
     lua_pushcclosure(L, osi_story_dispatch, 2);
     lua_setfield(L, -2, "__call");
     lua_setmetatable(L, -2);
+    lua_pushstring(L, name);
+    return 2;
+}
+
+// Ext._Internal.OsiSignatures(name) -> { {Arity, InputArity, Type}, ... }, Type
+// being the FunctionType number.
+int l_osi_signatures(lua_State* L) {
+    const auto sigs = osi::signatures(luaL_checkstring(L, 1));
+    lua_createtable(L, (int)sigs.size(), 0);
+    for (std::size_t i = 0; i < sigs.size(); ++i) {
+        lua_createtable(L, 0, 3);
+        lua_pushinteger(L, sigs[i].arity);
+        lua_setfield(L, -2, "Arity");
+        lua_pushinteger(L, sigs[i].inputs);
+        lua_setfield(L, -2, "InputArity");
+        lua_pushinteger(L, sigs[i].type);
+        lua_setfield(L, -2, "Type");
+        lua_rawseti(L, -2, (lua_Integer)i + 1);
+    }
     return 1;
 }
 
@@ -953,7 +1050,14 @@ int osi_dispatch(lua_State* L) {
         // in the mapping with five parameters and in Osiris' database with
         // three, four and five, the extra two being the story's own. A
         // count the mapping does not have is theirs, so it goes the way
-        // every story function goes -- a tuple into its node.
+        // every story function goes -- a tuple into its node. As upstream's
+        // name cache, a declaration is found by how many inputs it takes.
+        std::vector<std::uint16_t> storyBases;
+        if (!osi::declared_inputs(wanted, (std::size_t)argc, &storyBases)) {
+            return luaL_error(L, "No function named '%s' exists that can be called with %d parameters.",
+                              wanted, argc);
+        }
+        osi_check_inputs(L, 1, storyBases);
         const std::string key =
             std::string(wanted) + "/" + std::to_string(argc);
         std::vector<osi::Value> args;
@@ -974,25 +1078,15 @@ int osi_dispatch(lua_State* L) {
             return 0;
         }
 
-        // The story has this form; it was the arguments that failed.
-        if (convertible && why != "no such story function") {
-            return luaL_error(L, "Osi.%s: the story's %d-argument form could not be called: %s",
-                              wanted, argc, why.c_str());
-        }
-
-        std::string counts;
-        for (const osi::Function* candidate : *group) {
-            const int wants = expected_inputs(*candidate);
-            if (wants < 0) continue;
-            if (!counts.empty()) counts += " or ";
-            counts += std::to_string(wants);
-        }
-        return luaL_error(L,
-            "Incorrect number of IN arguments for '%s'; expected %s, got %d, "
-            "and the story declares no %d-argument form (%s)",
-            wanted, counts.empty() ? "none" : counts.c_str(), argc, argc,
-            why.empty() ? "not convertible" : why.c_str());
+        return luaL_error(L, "Osi.%s: the story's %d-argument form could not be called: %s",
+                          wanted, argc, why.empty() ? "an argument could not be converted" : why.c_str());
     }
+
+    std::vector<std::uint16_t> bases;
+    for (std::size_t i = 0; i < fn->params.size() && (int)bases.size() < argc; ++i) {
+        if (!fn->is_output(i, (std::size_t)argc)) bases.push_back(osi::resolve_alias(fn->params[i]));
+    }
+    osi_check_inputs(L, 1, bases);
 
     std::vector<osi::Value> inputs;
     inputs.reserve(argc);
@@ -1028,6 +1122,7 @@ int osi_dispatch(lua_State* L) {
         return 1;
     }
 
+    lua_checkstack(L, out_count + 1);
     if (status == osi::Status::kHandled) {
         for (const osi::Value& v : outputs) push_value(L, v);
     } else {
@@ -1228,6 +1323,10 @@ CMetatable* cpp_get_light_metatable(lua_State*, unsigned long long,
                                     unsigned long long) { return nullptr; }
 void cache_string(lua_State*, TString*) {}
 void release_string(lua_State*, TString*) {}
+
+// Ext._Internal.TableFindRaw(table, value), in src/vendor/table_find.cpp.
+extern "C" int bg3le_table_find_raw(lua_State* L);
+extern "C" int bg3le_table_is_linear_array(lua_State* L);
 
 // Address of an engine symbol by mangled name. The counterpart to Peek: with
 // both, a structure can be walked from the prompt without a rebuild.
@@ -1584,7 +1683,7 @@ enum class FieldKind : std::uint8_t {
     Int32, Uint32, Int64, Uint64, Guid, Entity, FixedString, LSString,
     ScalarArray, Struct, DynArray, Map, Optional, Variant, Inherit,
     ComponentHandle, ConditionId, Pointer, Text, Version, EntityOrVec3,
-    BitArray,
+    BitArray, GenomeVariant,
 };
 
 extern "C" const char* bg3le_meta_kind_name(std::uint8_t kind);
@@ -1599,6 +1698,8 @@ const char* field_kind_name(FieldKind kind) {
 // anything that is not a scalar, which stops an array of them being walked.
 std::size_t field_kind_size(FieldKind kind) {
     switch (kind) {
+        case FieldKind::GenomeVariant:
+            return 16;
         case FieldKind::Bool: case FieldKind::Int8: case FieldKind::Uint8:
             return 1;
         case FieldKind::Int16: case FieldKind::Uint16:
@@ -1691,11 +1792,18 @@ int push_text(lua_State* L, void const* meta, char const* path, void* base) {
     return 1;
 }
 
+extern "C" bool bg3le_genome_variant(void const* variant, std::uint32_t* typeName,
+                                     std::uint64_t* size, void** value);
+extern "C" bool bg3le_genome_set(void const* set, void** data, std::uint32_t* count);
+bool push_genome_variant(lua_State* L, void const* address);
+
 bool push_field(lua_State* L, const void* address, FieldKind kind,
                 FieldKind elemKind = FieldKind::Unsupported,
                 std::uint16_t elemCount = 0) {
     std::uint64_t raw = 0;
     switch (kind) {
+        case FieldKind::GenomeVariant:
+            return push_genome_variant(L, address);
         case FieldKind::ScalarArray: {
             // One-based, as Lua tables are. The stride comes from the element
             // kind, and a partial read fails the whole field rather than
@@ -1912,6 +2020,8 @@ bool entity_proxy_handle(lua_State* L, int index, std::uint64_t* handle) {
     return true;
 }
 
+extern "C" int bg3le_stats_condition_intern(char const* text);
+
 // Writes a field, converting the Lua value the way upstream's get<T> does.
 //
 // This used to refuse GUIDs and entity handles on purpose, as "not something
@@ -1919,9 +2029,319 @@ bool entity_proxy_handle(lua_State* L, int index, std::uint64_t* handle) {
 // was a gap rather than a safeguard: a mod written against it failed here.
 // What upstream does insist on is the type -- a GUID must be a string that
 // parses, an entity must be an entity or nil -- and so does this.
+// ---- gn::GenomeVariant, as upstream's LuaGetValue and LuaSetValue ----
+
+namespace genome {
+
+// A Genome type's value as bg3le reads and writes it: a field kind, and a count
+// for the float vectors and matrices.
+struct Shape {
+    FieldKind Kind;
+    std::uint16_t Count;
+};
+
+std::optional<Shape> shape_of(std::string const& type) {
+    if (type == "Bool") return Shape{FieldKind::Bool, 0};
+    if (type == "Float") return Shape{FieldKind::Float, 0};
+    if (type == "Int" || type == "Enum") return Shape{FieldKind::Int32, 0};
+    if (type == "Guid") return Shape{FieldKind::Guid, 0};
+    if (type == "FixedString" || type == "AnimationSimpleName" || type == "AnimationSetID"
+        || type == "AnimationComplexName") {
+        return Shape{FieldKind::FixedString, 0};
+    }
+    if (type == "String" || type == "Path") return Shape{FieldKind::LSString, 0};
+    if (type == "Vector3") return Shape{FieldKind::ScalarArray, 3};
+    if (type == "Rotator3") return Shape{FieldKind::ScalarArray, 4};
+    if (type == "Float3x3") return Shape{FieldKind::ScalarArray, 9};
+    if (type == "Float4x4") return Shape{FieldKind::ScalarArray, 16};
+    return std::nullopt;
+}
+
+// A set's element kind and stride.
+std::optional<std::pair<FieldKind, std::size_t>> set_of(std::string const& type) {
+    if (type == "FloatSet") return std::make_pair(FieldKind::Float, std::size_t{4});
+    if (type == "IntSet") return std::make_pair(FieldKind::Int32, std::size_t{4});
+    if (type == "ShortNameSet" || type == "FixedStringSet") {
+        return std::make_pair(FieldKind::FixedString, std::size_t{4});
+    }
+    if (type == "StringSet") return std::make_pair(FieldKind::LSString, std::size_t{16});
+    return std::nullopt;
+}
+
+bool type_name(void const* variant, std::string* name, void** value) {
+    std::uint32_t index = 0;
+    std::uint64_t size = 0;
+    if (!bg3le_genome_variant(variant, &index, &size, value)) return false;
+    name->clear();
+    if (index == 0xffffffffu) return true;
+    std::uint32_t length = 0;
+    char const* text = bg3le_fixed_string(index, &length);
+    if (text == nullptr) return false;
+    name->assign(text, length);
+    return true;
+}
+
+// Ext._Internal.PointedObject(address, class), for TimelineData.
+void push_object(lua_State* L, void* address, char const* cls) {
+    lua_getglobal(L, "Ext");
+    lua_getfield(L, -1, "_Internal");
+    lua_getfield(L, -1, "PointedObject");
+    lua_remove(L, -2);
+    lua_remove(L, -2);
+    lua_pushinteger(L, (lua_Integer)(std::uintptr_t)address);
+    lua_pushstring(L, cls);
+    lua_call(L, 2, 1);
+}
+
+// Plain values compare raw; tables by their array parts.
+bool same_value(lua_State* L, int a, int b) {
+    a = lua_absindex(L, a);
+    b = lua_absindex(L, b);
+    if (lua_type(L, a) != LUA_TTABLE || lua_type(L, b) != LUA_TTABLE) return lua_rawequal(L, a, b) != 0;
+    const lua_Integer n = (lua_Integer)lua_rawlen(L, a);
+    if ((lua_Integer)lua_rawlen(L, b) != n) return false;
+    for (lua_Integer i = 1; i <= n; ++i) {
+        lua_rawgeti(L, a, i);
+        lua_rawgeti(L, b, i);
+        const bool same = same_value(L, -2, -1);
+        lua_pop(L, 2);
+        if (!same) return false;
+    }
+    return true;
+}
+
+void type_error(std::string const& from, std::string const& to) {
+    char text[512];
+    std::snprintf(text, sizeof(text), "Tried to change type of GenomeVariant from %s to %s!", from.c_str(), to.c_str());
+    debug_server_output(text, 2);
+    logf("lua: %s", text);
+}
+
+}  // namespace genome
+
 bool write_field(lua_State* L, int index, void* address, FieldKind kind,
-                 FieldKind elemKind = FieldKind::Unsupported,
-                 std::uint16_t elemCount = 0) {
+                 FieldKind elemKind = FieldKind::Unsupported, std::uint16_t elemCount = 0);
+
+bool push_genome_variant(lua_State* L, void const* address) {
+    std::string type;
+    void* value = nullptr;
+    if (!genome::type_name(address, &type, &value)) return false;
+    if (type.empty()) {
+        lua_pushnil(L);
+        return true;
+    }
+    if (auto shape = genome::shape_of(type)) {
+        return push_field(L, value, shape->Kind == FieldKind::ScalarArray ? FieldKind::ScalarArray : shape->Kind,
+                          FieldKind::Float, shape->Count);
+    }
+    if (auto set = genome::set_of(type)) {
+        void* data = nullptr;
+        std::uint32_t count = 0;
+        if (!bg3le_genome_set(value, &data, &count)) return false;
+        if (count > (1u << 16) || (count != 0 && data == nullptr)) {
+            logf("genome: %s at %p claims %u elements; not read", type.c_str(), value, count);
+            return false;
+        }
+        lua_createtable(L, (int)count, 0);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            if (!push_field(L, static_cast<char*>(data) + i * set->second, set->first)) {
+                lua_pop(L, 1);
+                return false;
+            }
+            lua_rawseti(L, -2, (lua_Integer)i + 1);
+        }
+        return true;
+    }
+    if (type == "TimelineData") {
+        genome::push_object(L, value, "gn::GenomeTimelineData");
+        return true;
+    }
+    static std::unordered_set<std::string> warned;
+    static std::mutex warnedLock;
+    {
+        const std::lock_guard<std::mutex> held(warnedLock);
+        if (warned.insert(type).second) {
+            const std::string text = "Unsupported Genome variant type: " + type;
+            debug_server_output(text.c_str(), 1);
+            logf("lua: %s", text.c_str());
+        }
+    }
+    lua_pushnil(L);
+    return true;
+}
+
+// Upstream's GenomeVariant(L, index) then its move-assign: a value of the
+// variant's own type is stored, in place here; another type, or none, is
+// refused with upstream's error and leaves it as it was. Raises as upstream's
+// get<T> does for a value that does not convert.
+bool write_genome_variant(lua_State* L, int index, void* address) {
+    index = lua_absindex(L, index);
+    const int top = lua_gettop(L);
+    std::string current;
+    void* value = nullptr;
+    if (!genome::type_name(address, &current, &value)) return false;
+    // What it already holds, written back (a copy), changes nothing.
+    if (!current.empty() && push_genome_variant(L, address)) {
+        const bool same = genome::same_value(L, index, -1);
+        lua_settop(L, top);
+        if (same) return true;
+    }
+
+    std::string wanted;
+    int at = index;
+    switch (lua_type(L, index)) {
+        case LUA_TNIL: break;
+        case LUA_TBOOLEAN: wanted = "Bool"; break;
+        case LUA_TNUMBER: wanted = lua_isinteger(L, index) ? "Int" : "Float"; break;
+        case LUA_TSTRING: wanted = "FixedString"; break;
+        case LUA_TTABLE:
+            lua_getfield(L, index, "Type");
+            if (!lua_isnil(L, -1)) wanted = luaL_checkstring(L, -1);
+            lua_pop(L, 1);
+            lua_getfield(L, index, "Value");
+            at = lua_gettop(L);
+            break;
+        default:
+            return luaL_error(L, "Unsupported Lua type for Genome variant assignment: %s",
+                              luaL_typename(L, index)) != 0;
+    }
+    if (wanted.empty()) {
+        if (!current.empty()) genome::type_error(current, "(Untyped)");
+        lua_settop(L, top);
+        return true;
+    }
+
+    auto shape = genome::shape_of(wanted);
+    auto set = genome::set_of(wanted);
+    if (!shape && !set && wanted != "TimelineData") {
+        if (wanted == current) luaL_error(L, "Assignment not supported for this Genome type: %s", wanted.c_str());
+        luaL_error(L, "Genome type does not exist: %s", wanted.c_str());
+    }
+    // The value converts or raises, before the types are compared, as upstream
+    // builds its temporary first.
+    if (shape && shape->Kind == FieldKind::ScalarArray) {
+        luaL_checktype(L, at, LUA_TTABLE);
+        for (std::uint16_t i = 1; i <= shape->Count; ++i) {
+            lua_rawgeti(L, at, i);
+            luaL_checknumber(L, -1);
+            lua_pop(L, 1);
+        }
+    } else if (shape && shape->Kind == FieldKind::Bool) {
+        luaL_checktype(L, at, LUA_TBOOLEAN);
+    } else if (shape && shape->Kind == FieldKind::Float) {
+        luaL_checknumber(L, at);
+    } else if (shape && shape->Kind == FieldKind::Int32) {
+        luaL_checkinteger(L, at);
+    } else if (shape) {
+        luaL_checkstring(L, at);
+    } else {
+        luaL_checktype(L, at, LUA_TTABLE);
+    }
+
+    if (current.empty()) {
+        return luaL_error(L, "bg3le: an untyped GenomeVariant cannot be given a value of type %s",
+                          wanted.c_str()) != 0;
+    }
+    if (current != wanted) {
+        genome::type_error(current, wanted);
+        lua_settop(L, top);
+        return true;
+    }
+
+    bool ok = true;
+    if (shape && shape->Kind == FieldKind::ScalarArray) {
+        float floats[16];
+        for (std::uint16_t i = 0; i < shape->Count; ++i) {
+            lua_rawgeti(L, at, i + 1);
+            floats[i] = (float)lua_tonumber(L, -1);
+            lua_pop(L, 1);
+        }
+        std::memcpy(value, floats, shape->Count * sizeof(float));
+    } else if (shape) {
+        ok = write_field(L, at, value, shape->Kind);
+    } else if (set) {
+        void* data = nullptr;
+        std::uint32_t count = 0;
+        if (!bg3le_genome_set(value, &data, &count)) return false;
+        if ((std::uint32_t)lua_rawlen(L, at) != count) {
+            return luaL_error(L, "bg3le: a %s can only be written at its own length (%d)", wanted.c_str(),
+                              (int)count) != 0;
+        }
+        for (std::uint32_t i = 0; i < count && ok; ++i) {
+            lua_rawgeti(L, at, (lua_Integer)i + 1);
+            ok = write_field(L, lua_gettop(L), static_cast<char*>(data) + i * set->second, set->first);
+            lua_pop(L, 1);
+        }
+    } else {
+        // TimelineData: its fields, as upstream's Unserialize of the struct.
+        lua_getglobal(L, "Ext");
+        lua_getfield(L, -1, "Types");
+        lua_getfield(L, -1, "Unserialize");
+        genome::push_object(L, value, "gn::GenomeTimelineData");
+        lua_pushvalue(L, at);
+        lua_call(L, 2, 0);
+    }
+    lua_settop(L, top);
+    return ok;
+}
+
+// Upstream's get<Version>: {major, minor, revision, build}, packed.
+bool write_version(lua_State* L, int index, void* address) {
+    index = lua_absindex(L, index);
+    luaL_checktype(L, index, LUA_TTABLE);
+    std::uint64_t part[4] = {};
+    for (int i = 0; i < 4; ++i) {
+        lua_rawgeti(L, index, i + 1);
+        part[i] = (std::uint64_t)(std::uint32_t)luaL_checkinteger(L, -1);
+        lua_pop(L, 1);
+    }
+    const std::uint64_t packed = ((part[0] & 0x1ffull) << 55) | ((part[1] & 0x1ffull) << 47)
+                                 | ((part[2] & 0xffffull) << 31) | (part[3] & 0x7fffffffull);
+    std::memcpy(address, &packed, sizeof(packed));
+    return true;
+}
+
+// Upstream's get<EntityOrVec3Variant>: a table is a position, anything else
+// an entity; the type byte follows the twelve bytes of the union.
+bool write_entity_or_vec3(lua_State* L, int index, void* address) {
+    index = lua_absindex(L, index);
+    auto* bytes = static_cast<unsigned char*>(address);
+    if (lua_type(L, index) == LUA_TTABLE) {
+        float v[3];
+        for (int i = 0; i < 3; ++i) {
+            lua_rawgeti(L, index, i + 1);
+            v[i] = (float)luaL_checknumber(L, -1);
+            lua_pop(L, 1);
+        }
+        std::memcpy(bytes, v, sizeof(v));
+        bytes[12] = 1;
+        return true;
+    }
+    if (!write_field(L, index, bytes, FieldKind::Entity)) return false;
+    bytes[12] = 0;
+    return true;
+}
+
+bool write_field(lua_State* L, int index, void* address, FieldKind kind,
+                 FieldKind elemKind, std::uint16_t elemCount) {
+    if (kind == FieldKind::GenomeVariant) return write_genome_variant(L, index, address);
+    if (kind == FieldKind::Version) return write_version(L, index, address);
+    if (kind == FieldKind::EntityOrVec3) return write_entity_or_vec3(L, index, address);
+    // An EnumValue or BitfieldValue -- a key or element read back from an enum
+    // container -- is its number in an integer slot, as upstream's get takes it.
+    if (kind >= FieldKind::Int8 && kind <= FieldKind::Uint64
+        && lua_type(L, index) == LUA_TUSERDATA) {
+        index = lua_absindex(L, index);
+        if (lua_getmetatable(L, index)) {
+            if (lua_getfield(L, -1, "__bg3leEnumValue") == LUA_TNUMBER
+                || (lua_pop(L, 1), lua_getfield(L, -1, "__bg3leBitfieldValue")) == LUA_TNUMBER) {
+                lua_replace(L, index);
+                lua_pop(L, 1);
+            } else {
+                lua_pop(L, 2);
+            }
+        }
+    }
     switch (kind) {
         case FieldKind::Guid: {
             // luaL_checklstring and Guid::ParseGuidString, as upstream's
@@ -1958,9 +2378,17 @@ bool write_field(lua_State* L, int index, void* address, FieldKind kind,
             std::memcpy(address, &handle, sizeof(handle));
             return true;
         }
-        case FieldKind::ConditionId:
-            luaL_error(L, "Setting ConditionId values is not supported");
-            return false;
+        case FieldKind::ConditionId: {
+            // Upstream's since v33: nil is no condition, text is GetOrCreateConditions'.
+            std::int32_t id = -1;
+            if (!lua_isnil(L, index)) {
+                std::size_t length = 0;
+                const char* text = luaL_checklstring(L, index, &length);
+                id = bg3le_stats_condition_intern(text);
+            }
+            std::memcpy(address, &id, sizeof(id));
+            return true;
+        }
         case FieldKind::BitArray: {
             if (!lua_istable(L, index)) return false;
             std::vector<unsigned char> bits((elemCount + 7) / 8);
@@ -2031,14 +2459,25 @@ bool write_field(lua_State* L, int index, void* address, FieldKind kind,
             // bg3le did not take it and the engine may still be holding it
             // elsewhere, and an over-count keeps a string alive where an
             // under-count frees one out from under a reader.
+            // nil is the null string, and a number converts, on a copy so the
+            // caller's value stays a number; anything else but a string raises,
+            // as upstream's do_get(FixedString).
+            if (lua_isnil(L, index)) {
+                const std::uint32_t null = 0xffffffffu;
+                std::memcpy(address, &null, sizeof(null));
+                return true;
+            }
+            if (lua_type(L, index) != LUA_TNUMBER) luaL_checktype(L, index, LUA_TSTRING);
+            lua_pushvalue(L, index);
             std::size_t length = 0;
-            const char* text = lua_tolstring(L, index, &length);
-            if (text == nullptr) return false;
+            const char* text = lua_tolstring(L, -1, &length);
 
             // Interned through the engine first (see bg3le_fixed_string_intern),
             // so a string created after startup gets the id its readers use.
             std::uint32_t id = 0;
-            if (!bg3le_fixed_string_intern(text, &id)) return false;
+            const bool interned = bg3le_fixed_string_intern(text, &id);
+            lua_pop(L, 1);
+            if (!interned) return false;
             std::memcpy(address, &id, sizeof(id));
             return true;
         }
@@ -2089,6 +2528,19 @@ int push_packed(lua_State* L, int index) {
 
 // A whole array assigned from a Lua list, as upstream's Array setter does:
 // the array becomes that many elements, each written as an element is.
+// A pointer, or a container of them: upstream's setter answers UnsupportedType.
+bool holds_pointers(void const* meta, char const* path, FieldKind kind) {
+    if (kind == FieldKind::Pointer) return true;
+    std::uint32_t offset = 0;
+    std::uint16_t size = 0;
+    std::uint8_t elemKind = 0;
+    std::uint8_t inner = 0;
+    std::uint16_t count = 0;
+    const std::string element = std::string(path) + "[0]";
+    return bg3le_meta_field(meta, element.c_str(), &offset, &size, &elemKind, &inner, &count)
+           && (FieldKind)elemKind == FieldKind::Pointer;
+}
+
 bool assign_array(lua_State* L, int index, void const* meta, const char* path,
                   void* base, FieldKind kind) {
     if (kind != FieldKind::DynArray || !lua_istable(L, index)) return false;
@@ -2211,9 +2663,8 @@ extern "C" char const* bg3le_meta_enum_lua_name(void const* handle, char const* 
 
 // An enum value as upstream pushes it: an EnumValue (Ext._Internal.EnumValue
 // in the prelude), or the label where the prelude has none yet.
-void push_enum_value(lua_State* L, void const* meta, const char* path,
-                     const char* label, std::uint64_t value) {
-    char const* name = bg3le_meta_enum_lua_name(meta, path);
+void push_enum_named(lua_State* L, char const* name, const char* label,
+                     std::uint64_t value) {
     const int top = lua_gettop(L);
     if (name != nullptr && lua_getglobal(L, "Ext") == LUA_TTABLE
         && lua_getfield(L, -1, "_Internal") == LUA_TTABLE
@@ -2228,6 +2679,11 @@ void push_enum_value(lua_State* L, void const* meta, const char* path,
     }
     lua_settop(L, top);
     lua_pushstring(L, label);
+}
+
+void push_enum_value(lua_State* L, void const* meta, const char* path,
+                     const char* label, std::uint64_t value) {
+    push_enum_named(L, bg3le_meta_enum_lua_name(meta, path), label, value);
 }
 
 bool push_enum(lua_State* L, void const* meta, const char* path,
@@ -2509,6 +2965,11 @@ int l_set_field(lua_State* L) {
     std::uint16_t elemCount = 0;
     bg3le_meta_field(meta, path, &fieldOffset, &fieldSize, &fieldKind,
                      &elemKind, &elemCount);
+    if (holds_pointers(meta, path, (FieldKind)kind)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s.%s holds pointers (UnsupportedType)", name, path);
+        return 2;
+    }
 
     if ((FieldKind)kind == FieldKind::Optional) {
         if (!write_optional(L, 4, meta, path, component)) {
@@ -2625,12 +3086,15 @@ extern "C" void* bg3le_entity_component_add(void* container, std::uint64_t handl
 extern "C" bool bg3le_entity_component_remove(void* container, std::uint64_t handle,
                                               std::uint16_t type, std::uint16_t inlineSize,
                                               void* dtor, bool immediate);
+extern "C" void bg3le_entity_component_finalize(void* container, std::uint64_t handle,
+                                                std::uint16_t type, void* slot);
 extern "C" int bg3le_entity_ecb_changes(void* container, std::uint64_t handle,
                                         std::uint16_t* types, void** components,
                                         bool (*isProxy)(std::uint16_t), int max,
                                         std::uint32_t* flags);
 extern "C" void* bg3le_meta_construct_component(void const* handle, void* slot);
 extern "C" void* bg3le_meta_proxy_destroy(void const* handle);
+extern "C" void* bg3le_meta_destroy(void const* handle);
 
 // The component's meta and type index, for a name upstream's ExtComponentType
 // accepts; one-frame components are not created or removed this way.
@@ -2652,11 +3116,13 @@ int l_entity_component_add(lua_State* L) {
     std::uint16_t type = 0;
     if (!component_type(luaL_checkstring(L, 2), &meta, &type)) return 0;
     const bool proxy = bg3le_meta_component_is_proxy(meta);
+    const bool immediate = lua_toboolean(L, 3) != 0;
     void* slot = bg3le_entity_component_add(
         world_container(), handle, type, (std::uint16_t)bg3le_meta_component_stride(meta),
-        proxy ? bg3le_meta_proxy_destroy(meta) : nullptr, lua_toboolean(L, 3) != 0);
+        proxy ? bg3le_meta_proxy_destroy(meta) : bg3le_meta_destroy(meta), immediate);
     void* component = slot != nullptr ? bg3le_meta_construct_component(meta, slot) : nullptr;
     if (component == nullptr) return 0;
+    if (immediate) bg3le_entity_component_finalize(world_container(), handle, type, slot);
     lua_pushinteger(L, (lua_Integer)(std::uintptr_t)component);
     lua_pushstring(L, bg3le_meta_class_name(meta));
     return 2;
@@ -2674,7 +3140,7 @@ int l_entity_component_remove(lua_State* L) {
     const bool proxy = bg3le_meta_component_is_proxy(meta);
     lua_pushboolean(L, bg3le_entity_component_remove(
         world_container(), handle, type, (std::uint16_t)bg3le_meta_component_stride(meta),
-        proxy ? bg3le_meta_proxy_destroy(meta) : nullptr, lua_toboolean(L, 3) != 0));
+        proxy ? bg3le_meta_proxy_destroy(meta) : bg3le_meta_destroy(meta), lua_toboolean(L, 3) != 0));
     return 1;
 }
 
@@ -3004,6 +3470,7 @@ extern "C" int bg3le_ext_plugin_settings(lua_State* L);
 extern "C" int bg3le_ext_plugin_get(lua_State* L);
 extern "C" int bg3le_ext_plugin_set(lua_State* L);
 extern "C" int bg3le_ext_save_file(lua_State* L);
+extern "C" int bg3le_ext_find_files(lua_State* L);
 extern "C" int bg3le_ext_write_data_file(lua_State* L);
 extern "C" int bg3le_ext_memory_usage(lua_State* L);
 extern "C" int bg3le_ext_show_error(lua_State* L);
@@ -3421,6 +3888,42 @@ int l_set_set(lua_State* L) {
 // of those has worked from the start; writing had no entry point at all,
 // which meant Ext.StaticData handed back a snapshot and a mod editing it
 // changed nothing. 5eSpells' whole job is editing spell lists.
+extern "C" bool bg3le_meta_array_erase(void const* handle, char const* path, void* base,
+                                       std::size_t index, bool append);
+
+// Ext._Internal.ArrayErase(handle, component, path, index0 or nil to append)
+// and ObjectArrayErase(address, class, path, ...): true, or nil when the field
+// has no erase (the caller then rebuilds it).
+int l_array_erase(lua_State* L) {
+    const auto handle = static_cast<std::uint64_t>(luaL_checkinteger(L, 1));
+    const char* name = luaL_checkstring(L, 2);
+    const char* path = luaL_checkstring(L, 3);
+    void const* meta = nullptr;
+    void* component = component_pointer(handle, name, &meta);
+    const bool append = lua_isnoneornil(L, 4);
+    if (meta == nullptr || component == nullptr
+        || !bg3le_meta_array_erase(meta, path, component, append ? 0 : (std::size_t)luaL_checkinteger(L, 4),
+                                   append)) {
+        return 0;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+int l_object_array_erase(lua_State* L) {
+    Subject subject;
+    const char* className = nullptr;
+    if (!subject_from_object(L, 1, 2, &subject, &className)) return 0;
+    const char* path = luaL_checkstring(L, 3);
+    const bool append = lua_isnoneornil(L, 4);
+    if (!bg3le_meta_array_erase(subject.Meta, path, subject.Base,
+                                append ? 0 : (std::size_t)luaL_checkinteger(L, 4), append)) {
+        return 0;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
 int l_object_set_field(lua_State* L) {
     Subject subject;
     const char* className = nullptr;
@@ -3463,6 +3966,11 @@ int l_object_set_field(lua_State* L) {
     std::uint16_t elemCount = 0;
     bg3le_meta_field(subject.Meta, path, &fieldOffset, &fieldSize, &fieldKind,
                      &elemKind, &elemCount);
+    if (holds_pointers(subject.Meta, path, (FieldKind)kind)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s.%s holds pointers (UnsupportedType)", className, path);
+        return 2;
+    }
 
     if ((FieldKind)kind == FieldKind::Optional) {
         if (!write_optional(L, 4, subject.Meta, path, subject.Base)) {
@@ -3569,6 +4077,8 @@ extern "C" bool bg3le_meta_map_key_label(void const* handle, char const* path,
 
 // A map key as upstream pushes it: an enum as its label, anything else as
 // its value. The kind follows it, so Lua can make an entity of an entity key.
+extern "C" char const* bg3le_meta_map_key_enum(void const* handle, char const* path);
+
 bool push_map_key(lua_State* L, void const* meta, char const* path,
                   void const* address, FieldKind kind) {
     const std::size_t width = field_kind_size(kind);
@@ -3576,7 +4086,8 @@ bool push_map_key(lua_State* L, void const* meta, char const* path,
     char const* label = nullptr;
     if (width != 0 && width <= 8 && safe_read(address, &raw, width)
         && bg3le_meta_map_key_label(meta, path, raw, &label)) {
-        lua_pushstring(L, label);
+        // An EnumValue, as upstream's map proxy pushes an enum key.
+        push_enum_named(L, bg3le_meta_map_key_enum(meta, path), label, raw);
     } else if (!push_field(L, address, kind)) {
         return false;
     }
@@ -5191,9 +5702,11 @@ int l_stats_functor_groups(lua_State* L) {
             continue;
         }
 
-        lua_createtable(L, 0, 2);
+        lua_createtable(L, 0, 3);
         lua_pushstring(L, textKey != nullptr ? textKey : "");
         lua_setfield(L, -2, "TextKey");
+        lua_pushinteger(L, (lua_Integer)(std::uintptr_t)functors);
+        lua_setfield(L, -2, "Set");
 
         const int count = bg3le_stats_functor_count(functors);
         lua_createtable(L, count < 0 ? 0 : count, 0);
@@ -7173,6 +7686,23 @@ int l_new_object_proxy(lua_State* L) {
     return 1;
 }
 
+// Ext._Internal.RaiseOutside(message): raises it as luaL_error does from an
+// upstream C function, positioned at the first caller outside bg3le's Lua.
+int l_raise_outside(lua_State* L) {
+    luaL_checkstring(L, 1);
+    lua_settop(L, 1);
+    luaL_where(L, 1);
+    lua_insert(L, 1);
+    lua_concat(L, 2);
+    return lua_error(L);
+}
+
+// Ext._Internal.Where() -> that position, as luaL_where gives it ("" for none)
+int l_where(lua_State* L) {
+    luaL_where(L, 1);
+    return 1;
+}
+
 // Ext._Internal.EntityProxyHandle(value) -> handle, or nil for a non-entity
 int l_entity_proxy_handle(lua_State* L) {
     std::uint64_t handle = 0;
@@ -7238,14 +7768,15 @@ extern "C" std::size_t bg3le_component_events_take(void* world,
                                                    std::uint8_t* kinds,
                                                    std::size_t max);
 
-// Ext._Internal.WatchComponentEvents(component) -> bool
+// Ext._Internal.WatchComponentEvents(component) -> watched, whether it is one-frame;
+// nil for a component the engine has no type for.
 int l_watch_component_events(lua_State* L) {
     const auto index = component_index(engine_name_of(luaL_checkstring(L, 1)));
-    lua_pushboolean(L, index && !(*index & 0x8000)
-                           && bg3le_component_events_watch(
-                               world_container(),
-                               static_cast<std::uint16_t>(*index)));
-    return 1;
+    if (!index) return 0;
+    lua_pushboolean(L, bg3le_component_events_watch(world_container(),
+                                                    static_cast<std::uint16_t>(*index)));
+    lua_pushboolean(L, (*index & 0x8000) != 0);
+    return 2;
 }
 
 extern "C" bool bg3le_system_hook(void* container, std::int32_t index, bool client);
@@ -7514,7 +8045,9 @@ int l_take_component_events(lua_State* L) {
     lua_createtable(L, (int)n, 0);
     int at = 0;
     for (std::size_t i = 0; i < n; ++i) {
-        auto name = ecs::name_of(ecs::Context::Component, types[i]);
+        auto name = ecs::name_of((types[i] & 0x8000) ? ecs::Context::OneFrameComponent
+                                                     : ecs::Context::Component,
+                                 types[i] & 0x7fff);
         if (!name) continue;
         void const* meta = bg3le_meta_component(name->c_str());
         const char* shortName = meta ? bg3le_meta_short_name(meta) : nullptr;
@@ -7832,7 +8365,7 @@ void run_sandbox() {
     char const* text = bg3le_builtin_lua("SandboxStartup.lua", &size);
     if (text == nullptr) {
         logf("lua: the builtin SandboxStartup.lua is missing");
-    } else if ((luaL_loadbuffer(g_lua, text, size, "=builtin://SandboxStartup.lua")
+    } else if ((luaL_loadbuffer(g_lua, text, size, "builtin://SandboxStartup.lua")
                 || lua_pcall(g_lua, 0, 0, 0)) != LUA_OK) {
         logf("lua: SandboxStartup.lua failed: %s", lua_tostring(g_lua, -1));
         lua_pop(g_lua, 1);
@@ -7960,6 +8493,12 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "EcsCounts");
     lua_pushcfunction(g_lua, l_symbol_addr);
     lua_setfield(g_lua, -2, "SymbolAddr");
+    lua_pushcfunction(g_lua, bg3le_table_find_raw);
+    lua_setfield(g_lua, -2, "TableFindRaw");
+    lua_pushinteger(g_lua, kExtenderApiVersion);
+    lua_setfield(g_lua, -2, "ApiVersion");
+    lua_pushcfunction(g_lua, bg3le_table_is_linear_array);
+    lua_setfield(g_lua, -2, "TableIsLinearArray");
     lua_pushcfunction(g_lua, l_ecs_storage);
     lua_setfield(g_lua, -2, "EcsStorage");
     lua_pushcfunction(g_lua, l_ecs_dump);
@@ -8022,6 +8561,14 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "NewEntityProxy");
     lua_pushcfunction(g_lua, l_new_object_proxy);
     lua_setfield(g_lua, -2, "NewObjectProxy");
+    lua_pushcfunction(g_lua, l_raise_outside);
+    lua_setfield(g_lua, -2, "RaiseOutside");
+    lua_pushcfunction(g_lua, l_array_erase);
+    lua_setfield(g_lua, -2, "ArrayErase");
+    lua_pushcfunction(g_lua, l_object_array_erase);
+    lua_setfield(g_lua, -2, "ObjectArrayErase");
+    lua_pushcfunction(g_lua, l_where);
+    lua_setfield(g_lua, -2, "Where");
     lua_pushcfunction(g_lua, l_is_vector);
     lua_setfield(g_lua, -2, "IsVector");
     lua_pushcfunction(g_lua, l_is_hash_set);
@@ -8070,6 +8617,8 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "EnumValueAt");
     lua_pushcfunction(g_lua, osi_story_lookup);
     lua_setfield(g_lua, -2, "StoryFunction");
+    lua_pushcfunction(g_lua, l_osi_signatures);
+    lua_setfield(g_lua, -2, "OsiSignatures");
     lua_pushcfunction(g_lua, l_is_client_state);
     lua_setfield(g_lua, -2, "IsClientState");
     lua_pushcfunction(g_lua, l_watch_osiris);
@@ -8489,6 +9038,8 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "LoadFile");
     lua_pushcfunction(g_lua, bg3le_ext_save_file);
     lua_setfield(g_lua, -2, "SaveFile");
+    lua_pushcfunction(g_lua, bg3le_ext_find_files);
+    lua_setfield(g_lua, -2, "FindFiles");
     lua_pushcfunction(g_lua, bg3le_ext_write_data_file);
     lua_setfield(g_lua, -2, "WriteDataFile");
     lua_pushcfunction(g_lua, bg3le_ext_memory_usage);
@@ -8958,7 +9509,7 @@ local function json_string(v)
   local escaped = v:gsub('[%z\1-\31"\\]', function(c)
     local simple = JSON_ESCAPES[c]
     if simple ~= nil then return simple end
-    return string.format('\\u%04x', c:byte())
+    return string.format('\\u%04X', c:byte())
   end)
   return '"' .. escaped .. '"'
 end
@@ -9005,32 +9556,42 @@ local function identity(v, meta)
 end
 
 local function json_number(v)
-  -- Floats print to full round-trip precision and keep a decimal point
-  -- even when whole, as the real extender's writer does: Weight is
-  -- 1.350000023841858 and ValueScale 1.0.
   if math.type(v) == "integer" then return tostring(v) end
   -- Upstream's writer has kWriteNanAndInfNullFlag, so NaN and the
   -- infinities come out as null.
   if v ~= v or v == math.huge or v == -math.huge then return "null" end
-  local text = string.format("%.17g", v)
-  for _, fmt in ipairs({"%.15g", "%.16g"}) do
-    local short = string.format(fmt, v)
-    if tonumber(short) == v then text = short break end
+  if v == 0 then return 1 / v < 0 and "-0.0" or "0.0" end
+  -- Upstream's writer is RapidJSON's: the shortest round-trip digits, laid
+  -- out by its Prettify (Weight 1.350000023841858, 1.0, 1e21, 1e-7).
+  local a = math.abs(v)
+  local sci
+  for p = 15, 17 do
+    sci = string.format("%." .. (p - 1) .. "e", a)
+    if tonumber(sci) == a then break end
   end
-  if not text:find("[.eE]") then text = text .. ".0" end
-  return text
+  local lead, rest, exp = sci:match("^(%d)%.?(%d*)e([-+]%d+)$")
+  local digits = (lead .. rest):gsub("0+$", "")
+  local length = #digits
+  local kk = tonumber(exp) + 1  -- where the decimal point goes
+  local text
+  if kk >= length and kk <= 21 then
+    text = digits .. string.rep("0", kk - length) .. ".0"
+  elseif kk > 0 and kk <= 21 then
+    text = digits:sub(1, kk) .. "." .. digits:sub(kk + 1)
+  elseif kk > -6 and kk <= 0 then
+    text = "0." .. string.rep("0", -kk) .. digits
+  elseif length == 1 then
+    text = digits .. "e" .. (kk - 1)
+  else
+    text = digits:sub(1, 1) .. "." .. digits:sub(2) .. "e" .. (kk - 1)
+  end
+  return (v < 0 and "-" or "") .. text
 end
 
+-- Upstream's lua_is_linear_array, which reads the table's layout: no hash
+-- part, and the array part without holes. {} is an array.
 local function is_linear_array(t)
-  local n = 0
-  for k in next, t do
-    if math.type(k) ~= "integer" or k < 1 then return false end
-    n = n + 1
-  end
-  for i = 1, n do
-    if rawget(t, i) == nil then return false end
-  end
-  return true
+  return Ext._Internal.TableIsLinearArray(t)
 end
 
 local stringify
@@ -9081,6 +9642,11 @@ local function stringify_table(t, indent, depth, ctx, out)
 
   for k, v in next, t do items[#items + 1] = {k, v} end
   if ctx.Beautify then
+    for _, item in ipairs(items) do
+      if type(item[1]) ~= "string" and type(item[1]) ~= "number" then
+        error("Can only stringify string or number table keys", 0)
+      end
+    end
     local rank = function(k)
       if type(k) == "string" then return 0 end
       if math.type(k) == "integer" then return 1 end
@@ -9222,13 +9788,13 @@ function Ext.Json.Stringify(...)
     ctx.Beautify = false
     local out = {}
     local done, err = pcall(stringify, v, "", 0, ctx, out)
-    if not done then error(err, 2) end
+    if not done then Ext._Internal.ReraiseAt(err, 2) end
     return Ext._Internal.JsonBinaryEncode(Ext.Json.Parse(table.concat(out)))
   end
 
   local out = {}
   local ok, err = pcall(stringify, v, "", 0, ctx, out)
-  if not ok then error(err, 2) end
+  if not ok then Ext._Internal.ReraiseAt(err, 2) end
   return table.concat(out)
 end
 
@@ -9245,10 +9811,48 @@ function Ext.DumpShallow(v)
   }))
 end
 
+-- Upstream's Ext.Table.Find (Lua/Shared/LuaTable.inl): where the value sits,
+-- compared raw -- an index for an array or set, a key for a map -- or nil.
+-- A view's elements are read afresh, so they also match by identity, as
+-- upstream's light objects do by pointer.
 Ext.Table = {
   Find = function(tbl, value)
-    for k, v in pairs(tbl) do
-      if v == value then return v, k end
+    local t = type(tbl)
+    if t == "table" then return Ext._Internal.TableFindRaw(tbl, value) end
+    if t == "nil" then return nil end
+    if t ~= "userdata" then
+      error("Expected a table or userdata value; got " .. Ext.Types.GetValueType(tbl), 2)
+    end
+    local meta = Ext._Internal.RawGetMetatable(tbl)
+    local container = type(meta) == "table" and meta.__bg3leContainer or nil
+    if container == nil then
+      error("Expected an array, map or set value; got " .. Ext.Types.GetValueType(tbl), 2)
+    end
+    local function identity(v)
+      local m = Ext._Internal.RawGetMetatable(v)
+      local id = type(m) == "table" and m.__bg3leIdentity or nil
+      if type(id) == "function" then id = id() end
+      return type(id) == "string" and id or nil
+    end
+    local function same(a)
+      if rawequal(a, value) then return true end
+      local ha, hb = Ext._Internal.EntityProxyHandle(a), Ext._Internal.EntityProxyHandle(value)
+      if ha ~= nil then return ha == hb end
+      local ia = identity(a)
+      return ia ~= nil and ia == identity(value)
+    end
+    -- A map knows its own order: a HashMap answers the position, a legacy map the key.
+    if meta.__bg3leFind ~= nil then return meta.__bg3leFind(same) end
+    if container == "map" then
+      for k, v in pairs(tbl) do
+        if same(v) then return k end
+      end
+      return nil
+    end
+    -- A set by its i-th element, as upstream's GetElementAt.
+    local at = meta.__bg3leSetAt or function(i) return tbl[i] end
+    for i = 1, #tbl do
+      if same(at(i)) then return i end
     end
     return nil
   end
@@ -9279,12 +9883,24 @@ function Ext.IO.LoadFile(path, context)
   return Ext._Internal.LoadFile(path, context)
 end
 
+-- Upstream takes the contents as a string; a number converts, anything else raises.
+local function file_contents(fn, contents)
+  if type(contents) ~= "string" and type(contents) ~= "number" then
+    error("bad argument #2 to '" .. fn .. "' (string expected, got " .. type(contents) .. ")", 3)
+  end
+  return tostring(contents)
+end
+
 function Ext.IO.SaveFile(path, contents)
-  return Ext._Internal.SaveFile(path, tostring(contents), false)
+  return Ext._Internal.SaveFile(path, file_contents("SaveFile", contents), false)
 end
 
 function Ext.IO.AppendFile(path, contents)
-  return Ext._Internal.SaveFile(path, tostring(contents), true)
+  return Ext._Internal.SaveFile(path, file_contents("AppendFile", contents), true)
+end
+
+function Ext.IO.FindFiles(path, glob, context, recursive, checkPackedFiles)
+  return Ext._Internal.FindFiles(tostring(path), tostring(glob), context, recursive, checkPackedFiles)
 end
 
 -- bg3le's own, not upstream's: native plugins (include/bg3le_plugin.h) and
@@ -9415,8 +10031,18 @@ end
 -- StatsLoaded is deliberately not re-fired, as upstream does not: stats did
 -- not reload, and a mod's stats pass is not idempotent.
 -- ecl::ScriptExtender::OnGameStateChanged's event, on the client's thread.
+-- The states as upstream pushes them: ClientGameState or ServerGameState values.
+function Ext._Internal.GameStateValue(label)
+  if label == nil then return nil end
+  local enum = Ext.Enums[Ext.IsClient() and "ClientGameState" or "ServerGameState"]
+  return enum ~= nil and enum[label] or label
+end
+
 function Ext._Internal.ClientStateChanged(from, to)
-  Ext._Internal.FireEvent("GameStateChanged", { FromState = from, ToState = to })
+  Ext._Internal.FireEvent("GameStateChanged", {
+    FromState = Ext._Internal.GameStateValue(from),
+    ToState = Ext._Internal.GameStateValue(to),
+  })
 end
 
 -- esv::ScriptExtender::OnGameStateChanged's, from the server tick
@@ -9449,6 +10075,9 @@ end
 Ext.Osiris = {}
 
 local osiris_listeners = {}
+-- Subscriber id -> its list, as upstream's OsirisCallbacks hands out ids.
+local osiris_subscribers = {}
+local next_osiris_subscriber = 0
 
 local osiris_events = {
   before = true, after = true, beforeDelete = true, afterDelete = true
@@ -9465,12 +10094,14 @@ local function osiris_listener_name(name)
 end
 
 function Ext.Osiris.RegisterListener(name, arity, event, handler)
-  if type(name) ~= "string" or type(handler) ~= "function" then
-    error("Ext.Osiris.RegisterListener(name, arity, event, handler)", 2)
+  name = Ext._Internal.CheckString(name, 1, 2)
+  arity = Ext._Internal.CheckInteger(arity, 2, 2)
+  event = Ext._Internal.CheckString(event, 3, 2)
+  if type(handler) ~= "function" then
+    Ext._Internal.ArgError(4, "function expected, got " .. Ext.Types.GetValueType(handler), 2)
   end
   if not osiris_events[event] then
-    error("Ext.Osiris.RegisterListener: event must be one of before, after, " ..
-          "beforeDelete, afterDelete; got " .. tostring(event), 2)
+    Ext._Internal.RaiseOutside("Hook type must be 'before', 'beforeDelete', 'after' or 'afterDelete'")
   end
 
   -- Watching costs two patched vtable slots and an index of Osiris'
@@ -9481,28 +10112,31 @@ function Ext.Osiris.RegisterListener(name, arity, event, handler)
   end
 
   -- An engine call has no node; it is seen at the DIV boundary instead,
-  -- and like upstream it has no delete triggers.
+  -- and like upstream it has no delete triggers: the subscriber still gets
+  -- its id, and never fires.
   if Ext._Internal.WatchOsirisCall(name, arity)
      and (event == "beforeDelete" or event == "afterDelete") then
     Ext.Log.PrintError("Couldn't register Osiris subscriber for " .. name
       .. "/" .. tostring(arity) .. ": Delete triggers not supported on events.")
-    return
   end
 
   name = osiris_listener_name(name)
   local key = name .. "/" .. tostring(arity) .. "/" .. tostring(event)
   osiris_listeners[key] = osiris_listeners[key] or {}
-  table.insert(osiris_listeners[key], handler)
-  return handler
+  next_osiris_subscriber = next_osiris_subscriber + 1
+  local id = next_osiris_subscriber
+  table.insert(osiris_listeners[key], {Id = id, Handler = handler})
+  osiris_subscribers[id] = osiris_listeners[key]
+  return id
 end
 
-function Ext.Osiris.UnregisterListener(name, arity, event, handler)
-  name = osiris_listener_name(name)
-  local key = name .. "/" .. tostring(arity) .. "/" .. tostring(event)
-  local list = osiris_listeners[key]
+-- Upstream's UnregisterListener(subscriberId) -> boolean.
+function Ext.Osiris.UnregisterListener(id)
+  local list = osiris_subscribers[id]
   if list == nil then return false end
-  for i, h in ipairs(list) do
-    if h == handler then table.remove(list, i) return true end
+  osiris_subscribers[id] = nil
+  for i, entry in ipairs(list) do
+    if entry.Id == id then table.remove(list, i) return true end
   end
   return false
 end
@@ -9512,10 +10146,15 @@ function Ext._Internal.FireOsirisListener(name, arity, event, ...)
   local list = osiris_listeners[name .. "/" .. tostring(arity) .. "/"
                                .. tostring(event)]
   if list == nil then return end
-  for _, handler in ipairs(list) do
-    local ok, err = xpcall(handler, debug.traceback, ...)
-    if not ok then
-      Ext.Log.PrintError("Osiris event handler failed: " .. tostring(err))
+  -- The subscribers as the call began, as upstream's pendingCallbacks_; one
+  -- unregistered meanwhile is skipped.
+  local snapshot = table.move(list, 1, #list, 1, {})
+  for _, entry in ipairs(snapshot) do
+    if osiris_subscribers[entry.Id] ~= nil then
+      local ok, err = xpcall(entry.Handler, debug.traceback, ...)
+      if not ok then
+        Ext.Log.PrintError("Osiris event handler failed: " .. tostring(err))
+      end
     end
   end
 end
@@ -9912,18 +10551,12 @@ end
 -- Every enum and bitfield bg3se describes, by its Lua name, each one a table
 -- reached by label or by numeric value:
 --
---   Ext.Enums.ClientGameState.Menu   -->  "Menu"
---   Ext.Enums.ClientGameState[3]     -->  "Menu"
+--   Ext.Enums.ClientGameState.Menu   -->  EnumValue Menu
+--   Ext.Enums.ClientGameState[3]     -->  EnumValue Menu
 --
--- Upstream's entries are EnumValue objects rather than strings, and the
--- difference is deliberate. bg3le reads an enum-typed field as its label --
--- that is what reference/ verifies against the real extender, attribute for
--- attribute -- and a comparison is what a mod does with these:
--- Mod Configuration Menu asks
--- `Ext.Utils.GetGameState() == Ext.Enums.ClientGameState["Menu"]`. Two
--- strings compare equal there; a proxy object against a string never would,
--- because Lua's __eq does not fire unless both sides are the same type. The
--- label is the form that makes the comparison mean what it says.
+-- EnumValues, as upstream's RegisterEnumeration makes them. The Lua fork
+-- compares one with its label or number, so Mod Configuration Menu's
+-- `Ext.Utils.GetGameState() == Ext.Enums.ClientGameState["Menu"]` holds.
 --
 -- Built on first use and kept. There are hundreds of enums and a mod
 -- generally wants one, so each is filled in when it is named.
@@ -9950,7 +10583,8 @@ local function build_enum(name)
     -- Both directions, as upstream does: the label names the entry and the
     -- numeric value reaches the same one. A bitfield's entries are
     -- BitfieldValues, as upstream's RegisterEnumeration makes them.
-    local entry = bitfield and Ext._Internal.BitfieldValue(name, value) or label
+    local entry = bitfield and Ext._Internal.BitfieldValue(name, value)
+                  or Ext._Internal.EnumValue(name, label, value)
     made[label] = entry
     made[value] = entry
     i = i + 1
@@ -10070,6 +10704,27 @@ function Ext.Types.GetTypeInfo(typeName)
   if view == nil or view.Kind == "Unknown" then return nil end
   return view
 end
+
+-- Every property of an object type, its ancestors' included, as upstream's
+-- IterableProperties; nil for a type that is not an object.
+local member_sets = {}
+function Ext._Internal.TypeMemberSet(typeName)
+  local hit = member_sets[typeName]
+  if hit ~= nil then return hit or nil end
+  local at = Ext._Internal.TypeInfoAt(typeName)
+  local fields = at and Ext._Internal.TypeInfoFields(at)
+  if fields == nil or fields.Kind ~= "Object" then
+    member_sets[typeName] = false
+    return nil
+  end
+  hit = {}
+  while at ~= nil and at ~= 0 do
+    for name in pairs(Ext._Internal.TypeInfoEach(at, 0)) do hit[name] = true end
+    at = (Ext._Internal.TypeInfoFields(at) or {}).ParentType
+  end
+  member_sets[typeName] = hit
+  return hit
+end
 end
 
 function Ext.Types.GetObjectType(object)
@@ -10144,9 +10799,8 @@ end
 -- earlier version here stringified, which would have handed a mod a string
 -- where it expected a table.
 local function deep_plain(value, seen)
-  -- An enum value serializes as its label, as upstream's does.
-  local label = Ext._Internal.EnumLabelOf(value)
-  if label ~= nil then return label end
+  -- An enum value stays one, as upstream's push(L, *obj) leaves it.
+  if Ext._Internal.EnumLabelOf(value) ~= nil then return value end
   -- A bitfield stays one, as upstream's push(L, *obj) leaves it.
   if Ext._Internal.BitfieldOf(value) ~= nil then return value end
   if not Ext._Internal.Walkable(value) then return value end
@@ -10154,14 +10808,77 @@ local function deep_plain(value, seen)
 
   local out = {}
   seen[value] = out
+  -- Upstream serializes a struct's pointer member as nothing
+  -- (GenericNullSerializeProperty) and a container's pointer element as a reference.
+  local meta = Ext._Internal.RawGetMetatable(value)
+  local struct = type(meta) == "table" and meta.__bg3leContainer == nil and meta.__bg3leIdentity ~= nil
+  -- A getter or custom member (ServerCharacter.Character is the object itself)
+  -- has no Serialize upstream.
+  local typeName = struct and meta.__name or nil
   for k, v in pairs(value) do
-    if type(v) ~= "function" then out[k] = deep_plain(v, seen) end
+    if type(v) ~= "function" and not (typeName and Ext._Internal.CustomMember(typeName, k) ~= nil) then
+      -- A pointer: nothing as a struct's member, the object itself (upstream's
+      -- MakeObjectRef) as a container's element -- never followed.
+      local vm = Ext._Internal.RawGetMetatable(v)
+      if not (type(vm) == "table" and vm.__bg3lePointer) then
+        out[k] = deep_plain(v, seen)
+      elseif not struct then
+        out[k] = v
+      end
+    end
   end
   return out
 end
 
+-- Upstream's takes an object, array, map or set proxy (bg3le's stat objects
+-- among them); anything else raises, an entity or enum value included.
+-- The conversion itself, for bg3le's own use on any value.
+function Ext._Internal.DeepPlain(value) return deep_plain(value, {}) end
+
+-- bg3le's plain tables standing in for upstream objects (a Module, a stat's
+-- functor groups), which upstream's Serialize takes as the objects they are.
+Ext._Internal.StandIns = setmetatable({}, {__mode = "k"})
+
 function Ext.Types.Serialize(object)
+  if Ext._Internal.StandIns[object] then return deep_plain(object, {}) end
+  local refused = Ext._Internal.EntityProxyHandle(object) ~= nil and "Entity"
+    or Ext._Internal.EnumLabelOf(object) ~= nil and "Enum"
+    or Ext._Internal.BitfieldOf(object) ~= nil and "Bitfield" or nil
+  if refused then
+    error("Don't know how to serialize userdata of type " .. refused, 2)
+  end
+  local meta = Ext._Internal.RawGetMetatable(object)
+  if type(meta) ~= "table" or meta.__pairs == nil then
+    error("Param 1: expected a light C++ object, got " .. Ext.Types.GetValueType(object), 2)
+  end
   return deep_plain(object, {})
+end
+
+-- Upstream's Unserialize ignores what a property's setter refuses -- a
+-- pointer, or a container of them, is UnsupportedType -- and only a raised
+-- error, such as a value of the wrong type, propagates.
+-- A container reached through a pointer (an Array<T>*), marked as a pointed-to
+-- object is: a reference, which upstream neither copies nor writes through.
+function Ext._Internal.MarkPointer(v)
+  local m = Ext._Internal.RawGetMetatable(v)
+  if type(m) == "table" and m.__bg3leContainer ~= nil then m.__bg3lePointer = true end
+  return v
+end
+
+function Ext._Internal.PointerView(v)
+  local m = Ext._Internal.RawGetMetatable(v)
+  return type(m) == "table" and m.__bg3lePointer ~= nil
+end
+
+function Ext._Internal.HoldsPointers(container)
+  for _, e in pairs(container) do return Ext._Internal.PointerView(e) end
+  return false
+end
+
+function Ext._Internal.WriteRefused(err)
+  if type(err) ~= "string" then return false end
+  local why = err:gsub("^[^\n]-:%d+: ", "", 1)
+  return why:find("^Cannot set property ") ~= nil or why:find("^bg3le: ") ~= nil
 end
 
 -- Upstream's Unserialize writes nested objects in place: a struct field by
@@ -10173,39 +10890,61 @@ local function unserialize_into(object, values)
     assign(values)
     return
   end
+  if type(meta) == "table" and meta.__bg3leContainer == "map" then
+    Ext._Internal.RefillMap(object, values)
+    return
+  end
+  -- Upstream walks the struct's properties, so a key it lacks is ignored.
+  local typeName = Ext.Types.GetObjectType(object)
+  local members = typeName ~= nil and Ext._Internal.TypeMemberSet(typeName) or nil
   for k, v in pairs(values) do
+    if members ~= nil and members[k] == nil then goto continue end
+    -- Getters and custom members are not among upstream's Unserialize properties.
+    if typeName ~= nil and Ext._Internal.CustomMember(typeName, k) ~= nil then goto continue end
     local cur
     if type(v) == "table" then
       local ok, value = pcall(function() return object[k] end)
       if ok then cur = value end
-    end
-    if type(v) == "table" and Ext._Internal.Fillable(cur) then
-      local okLen, n = false, nil
-      if next(v) == nil or v[1] ~= nil then
-        okLen, n = pcall(function() return #cur end)
+      if Ext._Internal.PointerView(cur)
+         or (Ext._Internal.Fillable(cur) and Ext._Internal.HoldsPointers(cur)) then
+        goto continue
       end
-      if okLen and n ~= #v then
-        object[k] = v  -- resizes; the setter fills struct elements
+    end
+    local ok, err = pcall(function()
+      if type(v) == "table" and Ext._Internal.Fillable(cur) then
+        local okLen, n = false, nil
+        if next(v) == nil or v[1] ~= nil then
+          okLen, n = pcall(function() return #cur end)
+        end
+        if okLen and n ~= #v then
+          object[k] = v  -- resizes; the setter fills struct elements
+        else
+          unserialize_into(cur, v)
+        end
       else
-        unserialize_into(cur, v)
+        local okSet, errSet = pcall(function() object[k] = v end)
+        -- A new map key: its value went in whole, or failed, and either way
+        -- its structs are filled in place.
+        local added = type(v) == "table" and object[k] or nil
+        if Ext._Internal.Fillable(added) then
+          unserialize_into(added, v)
+        elseif not okSet then
+          error(errSet, 0)
+        end
       end
-    else
-      local ok, err = pcall(function() object[k] = v end)
-      -- A new map key: its value went in whole, or failed, and either way
-      -- its structs are filled in place.
-      local added = type(v) == "table" and object[k] or nil
-      if Ext._Internal.Fillable(added) then
-        unserialize_into(added, v)
-      elseif not ok then
-        error(err, 0)
-      end
-    end
+    end)
+    if not ok and not Ext._Internal.WriteRefused(err) then error(err, 0) end
+    ::continue::
   end
 end
 
 function Ext.Types.Unserialize(object, values)
   if type(values) ~= "table" then
-    error("Ext.Types.Unserialize expects a table", 2)
+    -- luaL_checktype's wording: a userdata by its __name.
+    local got = type(values)
+    local meta = got == "userdata" and Ext._Internal.RawGetMetatable(values) or nil
+    if type(meta) == "table" and type(meta.__name) == "string" then got = meta.__name end
+    error("bad argument #2 to 'Unserialize' (table expected, got " .. got .. ")", 2)
   end
 
   -- Through the same setter an assignment uses, with one difference that
@@ -10216,8 +10955,7 @@ function Ext.Types.Unserialize(object, values)
   Ext._Internal.Unserializing = true
   local ok, err = pcall(unserialize_into, object, values)
   Ext._Internal.Unserializing = outer
-  if not ok then error(err, 2) end
-  return object
+  if not ok and not Ext._Internal.WriteRefused(err) then Ext._Internal.ReraiseAt(err, 2) end
 end
 
 -- Fills the struct elements of an array just assigned from a list: the
@@ -10319,7 +11057,7 @@ local function self_alias(name)
   return function(self)
     if not warned_self_alias[name] then
       warned_self_alias[name] = true
-      Ext.Log.PrintWarning("entity." .. name .. " is deprecated; use the component itself instead")
+      Ext.Log.PrintWarning("entity." .. name .. " is deprecated; use entity." .. name:match("^[^.]+") .. " instead")
     end
     return self
   end
@@ -10657,18 +11395,36 @@ end
 -- one, so it is the live table rather than a copy, and a write marks the
 -- key dirty through the proxy.
 function Ext.Vars.GetModVariables(moduleUuid)
+  -- Upstream's: nil for a mod outside the load order, and a holder for any
+  -- loaded mod, whether or not it has registered a variable yet.
+  if not Ext.Mod.IsModLoaded(moduleUuid) then
+    Ext.Log.PrintError("Module '" .. tostring(moduleUuid) .. "' is not loaded!")
+    return nil
+  end
+  mod_variable_defs[moduleUuid] = mod_variable_defs[moduleUuid] or {}
+  mod_variables[moduleUuid] = mod_variables[moduleUuid] or {}
   local defs = mod_variable_defs[moduleUuid]
-  -- An empty table, not nil, for a mod that has registered none: callers
-  -- iterate the result without checking, and upstream lets them.
-  if defs == nil then return {} end
-
-  local store = mod_variables[moduleUuid]
+  -- Looked up each time: a reload replaces the store.
+  local function store()
+    mod_variables[moduleUuid] = mod_variables[moduleUuid] or {}
+    return mod_variables[moduleUuid]
+  end
+  local function unregistered(key)
+    Ext.Log.PrintError("Mod variable class '" .. tostring(key) .. "' not registered for module '"
+                       .. tostring(moduleUuid) .. "'.")
+  end
   return Ext._Internal.NewObjectProxy({
-    __index = function(_, key) return store[key] end,
+    __index = function(_, key)
+      if defs[key] == nil then
+        unregistered(key)
+        return nil
+      end
+      return store()[key]
+    end,
     __newindex = function(_, key, value)
       if defs[key] == nil then
-        error("no mod variable named " .. tostring(key)
-              .. " is registered for " .. tostring(moduleUuid), 2)
+        unregistered(key)
+        return
       end
       local server = Ext.IsServer()
       if not Ext._Internal.VarOption(defs, key, server and "WriteableOnServer" or "WriteableOnClient") then
@@ -10676,13 +11432,13 @@ function Ext.Vars.GetModVariables(moduleUuid)
                            .. (server and "server" or "client"))
         return
       end
-      store[key] = value
+      store()[key] = value
       dirty_mod[moduleUuid] = dirty_mod[moduleUuid] or {}
       dirty_mod[moduleUuid][key] = true
       Ext._Internal.FlushVarsOnWrite(defs, key)
     end,
     __pairs = function()
-      return next, store, nil
+      return next, store(), nil
     end,
   })
 end
@@ -10785,6 +11541,17 @@ local function net_check(name, channel)
   end
 end
 
+-- Upstream's ExtenderMessage::MaxPayloadLength since v33; a longer one is dropped.
+local NET_MAX_PAYLOAD = 0xff000
+local function net_fits(channel, payload)
+  if payload ~= nil and #payload >= NET_MAX_PAYLOAD then
+    Ext.Log.PrintError(string.format("Channel %s: Tried to write net message of size %d, max size is %d",
+                                     channel, #payload, NET_MAX_PAYLOAD))
+    return false
+  end
+  return true
+end
+
 local function peer_of(user) return user >> 16 end
 
 -- Ext.IsServer is defined further down; the state already knows which it is.
@@ -10805,8 +11572,9 @@ if not Ext._Internal.IsClientState() then
 
   local function post_to_user(user, channel, payload, module, handler, replyId, binary)
     local info = Ext._Internal.NetInfo()
-    local requestId = net_request(handler)
     payload = net_payload(payload)
+    if not net_fits(channel, payload) then return end
+    local requestId = net_request(handler)
     if peer_of(user) == info.LocalPeer then
       Ext._Internal.PostToOtherContext(channel, payload, user, module, requestId,
                                        replyId, binary)
@@ -10822,8 +11590,12 @@ if not Ext._Internal.IsClientState() then
     net_check("BroadcastMessage", channel)
     local info = Ext._Internal.NetInfo()
     local exclude = character_user(excludeCharacter)
-    local requestId = net_request(requestHandler)
+    if excludeCharacter ~= nil and exclude == nil then
+      Ext.Log.PrintWarning("BroadcastMessage(): Invalid excludeCharacter GUID: " .. tostring(excludeCharacter))
+    end
     payload = net_payload(payload)
+    if not net_fits(channel, payload) then return end
+    local requestId = net_request(requestHandler)
     if exclude == nil or peer_of(exclude) ~= info.LocalPeer then
       Ext._Internal.PostToOtherContext(channel, payload, info.ReservedUser, module,
                                        requestId, replyId, binary)
@@ -10836,10 +11608,14 @@ if not Ext._Internal.IsClientState() then
                                        requestHandler, replyId, binary)
     net_check("PostMessageToClient", channel)
     local user = character_user(character)
-    if user == nil then return end
+    if user == nil then
+      Ext.Log.PrintError("Attempted to send message to nonexistent character " .. tostring(character)
+                         .. " on channel '" .. channel .. "'!")
+      return
+    end
     if user == Ext._Internal.NetInfo().ReservedUser then
       Ext.Log.PrintError("Attempted to send message to character " .. tostring(character)
-                         .. " on channel '" .. channel .. "' that has no user assigned!")
+                         .. " that has no user assigned on channel '" .. channel .. "'!")
       return
     end
     post_to_user(user, channel, payload, module, requestHandler, replyId, binary)
@@ -10876,15 +11652,18 @@ else
                                        replyId, binary)
     net_check("PostMessageToServer", channel)
     local info = Ext._Internal.NetInfo()
-    local requestId = net_request(requestHandler)
     payload = net_payload(payload)
-    -- To this process's own server; or to the host, if it has the extender;
-    -- or, with no host yet, queued for the server context here.
-    if info.Hosting or (not info.HostHasExtender and not info.Connected) then
+    if not net_fits(channel, payload) then return end
+    local requestId = net_request(requestHandler)
+    -- As upstream's: to this process's own server while it runs one, else to
+    -- the host. With neither -- the main menu -- it goes nowhere, as upstream's
+    -- send to a client with no host peer does.
+    if info.Hosting or info.ServerRunning then
       Ext._Internal.PostToOtherContext(channel, payload, info.LocalUser, module,
                                        requestId, replyId, binary)
       return
     end
+    if not info.Connected then return end
     local ok, err = Ext._Internal.NetPost(nil, channel, payload, module, requestId,
                                           replyId, binary)
     if not ok then Ext.Log.PrintError(err) end
@@ -11612,22 +12391,33 @@ end
 -- Ext.Require(path) or Ext.Require(modGuid, path): loads a mod's Lua file
 -- once, caching by the name it was asked for, as upstream does.
 local required = {}
+Ext._Internal.ModRequirers = {}
 
 function Ext.Require(a, b)
-  local path = b or a
-  if required[path] ~= nil then return required[path] end
-
-  local contents = Ext.IO.LoadFile(path, "data")
-  if contents == nil then
-    error("Ext.Require: cannot read " .. tostring(path), 2)
+  -- Ext.Require(modGuid, path): that mod's ScriptExtender/Lua/<path>, as
+  -- upstream's FileLoader includes it, every result kept.
+  if b ~= nil then
+    local own = Ext._Internal.ModRequirers[string.lower(tostring(a))]
+    if own ~= nil then return own(a, b) end
+    local key = tostring(a) .. "/" .. tostring(b)
+    if required[key] == nil then required[key] = table.pack(Ext.Utils.Include(a, b)) end
+    return table.unpack(required[key], 1, required[key].n)
   end
-  local chunk, err = Ext._Internal.RawLoad(contents, path, "t")
-  if chunk == nil then error(err, 2) end
+  -- Upstream's FileLoader: a builtin script, or a file of the mod whose
+  -- bootstrap is running.
+  local path = a
+  if type(path) == "string" and path:sub(1, 10) == "builtin://" then
+    if required[path] == nil then required[path] = table.pack(Ext.Utils.Include(nil, path)) end
+    return table.unpack(required[path], 1, required[path].n)
+  end
+  if ModuleUUID == nil then Ext._Internal.RequireWithoutMod() end
+  return Ext.Require(ModuleUUID, path)
+end
 
-  local result = chunk()
-  if result == nil then result = true end
-  required[path] = result
-  return result
+-- Raised where upstream raises it, inside its builtin FileLoader.lua.
+function Ext._Internal.RequireWithoutMod()
+  error('[string "builtin://Libs/FileLoader.lua"]:13: '
+        .. "Ext.Require() called without a mod, but the current mod UUID is not known!", 0)
 end
 
 -- Upstream's Startup.lua: one of the builtin:// libraries, loaded once.
@@ -11662,7 +12452,7 @@ Ext.Utils = {
 -- The extender version a mod tests against. bg3le reports the bg3se
 -- version whose public API it implements, because that is the question the
 -- mod is asking; reference/utils-shape.txt has the capture at 32.
-function Ext.Utils.Version() return 32 end
+function Ext.Utils.Version() return Ext._Internal.ApiVersion end
 
 -- Bound late: Ext.Timer is completed further down, after this table.
 function Ext.Utils.GameTime() return Ext.Timer.GameTime() end
@@ -11802,7 +12592,7 @@ function Ext.Utils.Profile(_, fn, ...) return fn(...) end
 function Ext.Utils.ProfileNamed(_, fn, ...) return fn(...) end
 
 function Ext.Utils.GetGameState()
-  return Ext._Internal.GameState and Ext._Internal.GameState() or "Running"
+  return Ext._Internal.GameStateValue(Ext._Internal.GameState and Ext._Internal.GameState() or "Running")
 end
 
 -- The engine's ls::GlobalSwitches, live, as upstream's; nil if it is not
@@ -11824,43 +12614,27 @@ if Ext._Internal.IsClientState() then
     return Ext._Internal.ReadObject(addr, "input::InputManager", "", {})
   end
 
-  -- Upstream's InjectKey*: an SDLScanCode label or number, and optionally an
-  -- SDLKeyModifier label, list of labels or number.
-  local function enum_number(enum, value, what)
-    if type(value) == "number" then return math.tointeger(value) end
-    local _, bits = Ext._Internal.BitfieldOf(value)
-    if bits ~= nil then return bits end
-    if type(value) == "table" then
-      local bits = 0
-      for _, label in ipairs(value) do bits = bits | enum_number(enum, label, what) end
-      return bits
-    end
-    if type(value) == "string" then
-      local i = 0
-      while true do
-        local label, n = Ext._Internal.EnumValueAt(enum, i)
-        if label == nil then break end
-        if label == value then return n end
-        i = i + 1
-      end
-    end
-    error(string.format("%s: not a %s: %s", what, enum, tostring(value)), 3)
+  -- An enum argument at index as upstream reads it, as its number.
+  local function enum_number(enum, value, index)
+    return Ext.Enums[enum][Ext._Internal.EnumArg(enum, value, index, 3)].Value
   end
 
-  local function inject(down, key, modifiers, what)
-    local mods = modifiers ~= nil and enum_number("SDLKeyModifier", modifiers, what) or 0
-    Ext._Internal.InjectKey(down, enum_number("SDLScanCode", key, what), mods)
+  -- Upstream's InjectKey*: an SDLScanCode and optionally an SDLKeyModifier.
+  local function inject(down, key, modifiers)
+    local code = enum_number("SDLScanCode", key, 1)
+    local mods = modifiers ~= nil and Ext._Internal.BitfieldArg("SDLKeyModifier", modifiers, 2, 3) or 0
+    Ext._Internal.InjectKey(down, code, mods)
   end
 
   function Ext.Input.InjectKeyPress(key, modifiers)
-    inject(true, key, modifiers, "Ext.Input.InjectKeyPress")
-    inject(false, key, modifiers, "Ext.Input.InjectKeyPress")
+    inject(true, key, modifiers)
+    inject(false, key, modifiers)
   end
   function Ext.Input.InjectKeyDown(key, modifiers)
-    inject(true, key, modifiers, "Ext.Input.InjectKeyDown")
+    inject(true, key, modifiers)
   end
   function Ext.Input.InjectKeyUp(key, modifiers)
-    inject(false, key, modifiers, "Ext.Input.InjectKeyUp")
+    inject(false, key, modifiers)
   end
 
   -- Upstream's client Audio module; src/vendor/audio.cpp.
@@ -11913,7 +12687,7 @@ if Ext._Internal.IsClientState() then
   function Ext.Audio.UnloadEvent(event) return A("UnloadEvent", event) end
   function Ext.Audio.PlayExternalSound(obj, event, path, codec, position)
     return A("PlayExternalSound", sound_object(obj), event, path,
-             enum_number("AudioCodec", codec, "Ext.Audio.PlayExternalSound"), position)
+             enum_number("AudioCodec", codec, 4), position)
   end
   function Ext.Audio.LoadBank(bank) return A("LoadBank", bank) end
   function Ext.Audio.UnloadBank(bank) return A("UnloadBank", bank) end
@@ -11934,21 +12708,40 @@ if Ext._Internal.IsClientState() then
 
   local UiObject = {}
   local ptr_of = setmetatable({}, {__mode = "k"})
+  local generation_of = setmetatable({}, {__mode = "k"})
+  -- The type name, read while the object is live: an expired proxy's may be freed.
+  local name_of = setmetatable({}, {__mode = "k"})
   local proxies = setmetatable({}, {__mode = "v"})
+
+  -- Upstream scopes a proxy to the Lua call that made it, so an element kept
+  -- from an earlier call raises rather than reaching memory the UI has since
+  -- freed. bg3le's scope is the client tick: UiPump starts a new one.
+  local generation = 0
+  -- Whether a deferred callback is running, for upstream's GetRoot warning.
+  local in_deferred = false
 
   local function wrap(ptr)
     if ptr == nil then return nil end
     local proxy = proxies[ptr]
-    if proxy == nil then
-      proxy = setmetatable({}, UiObject)
+    if proxy == nil or generation_of[proxy] ~= generation then
+      proxy = I.UiNewProxy(UiObject)
       ptr_of[proxy] = ptr
+      generation_of[proxy] = generation
+      name_of[proxy] = I.UiProxyTypeName(ptr)
       proxies[ptr] = proxy
     end
     return proxy
   end
 
+  local function live(proxy)
+    if generation_of[proxy] ~= generation then
+      error("Attempted to fetch 'Noesis::BaseObject' whose lifetime has expired", 0)
+    end
+    return ptr_of[proxy]
+  end
+
   local function unwrap(value)
-    if Ext._Internal.RawGetMetatable(value) == UiObject then return ptr_of[value] end
+    if Ext._Internal.RawGetMetatable(value) == UiObject then return live(value) end
     return value
   end
 
@@ -11958,7 +12751,9 @@ if Ext._Internal.IsClientState() then
   end
 
   local function out(value)
-    if type(value) == "userdata" then return wrap(value) end
+    if type(value) == "userdata" and Ext._Internal.RawGetMetatable(value) ~= UiObject then
+      return wrap(value)
+    end
     return value
   end
 
@@ -11987,42 +12782,54 @@ if Ext._Internal.IsClientState() then
   local methods = {}
 
   function methods:GetProperty(name)
-    local found, value = I.UiGet(ptr_of[self], name)
+    local found, value = I.UiGet(live(self), name)
     if not found then
-      Ext.Log.PrintError(no_property(ptr_of[self], name))
+      Ext.Log.PrintError(no_property(live(self), name))
       return nil
     end
     return out(value)
   end
 
   function methods:SetProperty(name, value)
-    if not I.UiSet(ptr_of[self], name, unwrap(value)) then
-      Ext.Log.PrintError(no_property(ptr_of[self], name))
+    if not I.UiSet(live(self), name, unwrap(value)) then
+      Ext.Log.PrintError(no_property(live(self), name))
     end
   end
 
   function methods:GetAllProperties()
-    return wrap_all(I.UiProperties(ptr_of[self], "all"))
+    return wrap_all(I.UiProperties(live(self), "all"))
   end
   function methods:DirectProperties()
-    return wrap_all(I.UiProperties(ptr_of[self], "direct"))
+    return wrap_all(I.UiProperties(live(self), "direct"))
   end
   function methods:DependencyProperties()
-    return wrap_all(I.UiProperties(ptr_of[self], "dependency"))
+    return wrap_all(I.UiProperties(live(self), "dependency"))
   end
-  function methods:ToString() return I.UiToString(ptr_of[self]) end
-  function methods:VisualChild(i) return wrap(I.UiVisualChild(ptr_of[self], i)) end
-  function methods:At(i) return wrap(I.UiCollectionItem(ptr_of[self], i)) end
-  function methods:Child(i) return wrap(I.UiChild(ptr_of[self], i)) end
-  function methods:Find(name) return wrap(I.UiFind(ptr_of[self], name)) end
+  function methods:ToString() return I.UiToString(live(self)) end
+  -- A class's descriptor never changes, so each is built once.
+  local type_infos = {}
+  function methods:TypeInfo()
+    local ptr = live(self)
+    local name = I.UiTypeName(ptr)
+    local info = type_infos[name]
+    if info == nil then
+      info = I.UiTypeInfo(ptr)
+      type_infos[name] = info
+    end
+    return info
+  end
+  function methods:VisualChild(i) return wrap(I.UiVisualChild(live(self), i)) end
+  function methods:At(i) return wrap(I.UiCollectionItem(live(self), i)) end
+  function methods:Child(i) return wrap(I.UiChild(live(self), i)) end
+  function methods:Find(name) return wrap(I.UiFind(live(self), name)) end
   function methods:Resource(key, full)
-    return wrap(I.UiResource(ptr_of[self], key, full == true))
+    return wrap(I.UiResource(live(self), key, full == true))
   end
-  function methods:CanExecute(arg) return I.UiCanExecute(ptr_of[self], unwrap(arg)) end
-  function methods:Execute(arg) I.UiExecute(ptr_of[self], unwrap(arg)) end
+  function methods:CanExecute(arg) return I.UiCanExecute(live(self), unwrap(arg)) end
+  function methods:Execute(arg) I.UiExecute(live(self), unwrap(arg)) end
 
   function methods:SetHandler(fn)
-    local ptr = ptr_of[self]
+    local ptr = live(self)
     local old = command_handler[ptr]
     if old ~= nil then handlers[old] = nil end
     local id = fn ~= nil and add_handler(fn) or 0
@@ -12032,10 +12839,10 @@ if Ext._Internal.IsClientState() then
 
   function methods:Subscribe(event, fn)
     local id = add_handler(fn)
-    local index = I.UiSubscribe(ptr_of[self], event, id)
+    local index = I.UiSubscribe(live(self), event, id)
     if index == nil then
       handlers[id] = nil
-      return nil
+      return 0
     end
     subscription_handler[index] = id
     return index
@@ -12059,39 +12866,59 @@ if Ext._Internal.IsClientState() then
   UiObject.__index = function(self, key)
     local method = methods[key]
     if method ~= nil then return method end
-    local ptr = ptr_of[self]
+    local ptr = live(self)
     -- A collection indexes from 1, as upstream's array proxy does.
     if math.type(key) == "integer" and I.UiCollectionCount(ptr) ~= nil then
       return wrap(I.UiCollectionItem(ptr, key))
     end
     local getter = getters[key]
     if getter ~= nil then return getter(ptr) end
+    local wfound, wvalue = I.UiWidgetField(ptr, key)
+    if wfound then return out(wvalue) end
     local found, value = I.UiGet(ptr, key)
     if found then return out(value) end
     -- Raised as upstream's LightObjectProxy does; only :GetProperty logs and returns nil.
-    error(string.format("Property does not exist: %s::%s - property does not exist",
-                        I.UiProxyTypeName(ptr), tostring(key)), 0)
+    I.RaiseOutside(string.format("Property does not exist: %s::%s - property does not exist",
+                                 I.UiProxyTypeName(ptr), tostring(key)))
   end
 
   UiObject.__newindex = function(self, key, value)
-    local ptr = ptr_of[self]
-    if not I.UiSet(ptr, key, unwrap(value)) then
-      error(string.format("Cannot set property %s::%s - property does not exist",
-                          I.UiProxyTypeName(ptr), tostring(key)), 0)
+    local ptr = live(self)
+    if math.type(key) == "integer" and I.UiCollectionCount(ptr) ~= nil then
+      -- Out of range does nothing, as upstream's SetElement returning false.
+      I.ProxySet(I.UiCollectionSet, ptr, key, unwrap(value))
+      return
+    end
+    -- Argument errors named for __newindex, as upstream's raise from it.
+    if not I.ProxySet(I.UiSet, ptr, key, unwrap(value)) then
+      I.RaiseOutside(string.format("Cannot set property %s::%s - property does not exist",
+                                   I.UiProxyTypeName(ptr), tostring(key)))
     end
   end
 
+  -- Upstream's "%s (%p)", and "%s (%p, DEAD REFERENCE)" once expired.
   UiObject.__tostring = function(self)
-    return string.format("%s (%s)", I.UiTypeName(ptr_of[self]), tostring(ptr_of[self]))
+    local ptr = ptr_of[self]
+    local at = (tostring(ptr):gsub("^userdata: ", ""))
+    if generation_of[self] ~= generation then
+      return string.format("%s (%s, DEAD REFERENCE)", tostring(name_of[self]), at)
+    end
+    return string.format("%s (%s)", tostring(name_of[self]), at)
+  end
+
+  -- The object, not the proxy: upstream's IsEqual ignores lifetimes.
+  UiObject.__eq = function(a, b)
+    local p = ptr_of[a]
+    return p ~= nil and p == ptr_of[b]
   end
 
   -- # and pairs over a collection's items; other objects keep reading as empty.
   UiObject.__len = function(self)
-    return I.UiCollectionCount(ptr_of[self]) or 0
+    return I.UiCollectionCount(live(self)) or 0
   end
 
   UiObject.__pairs = function(self)
-    local ptr = ptr_of[self]
+    local ptr = live(self)
     local n = I.UiCollectionCount(ptr)
     if n == nil then return next, {}, nil end
     local i = 0
@@ -12102,7 +12929,15 @@ if Ext._Internal.IsClientState() then
     end
   end
 
-  function Ext.UI.GetRoot() return wrap(I.UiRoot()) end
+  local warned_root = false
+  function Ext.UI.GetRoot()
+    if not in_deferred and not warned_root then
+      warned_root = true
+      Ext.Log.PrintWarning("Accessing Noesis state (Ext.UI.GetRoot()) from the global context carries a risk "
+        .. "of crashing; use Ext.UI.Defer(...) to ensure Noesis is only accessed from a deferred context.")
+    end
+    return wrap(I.UiRoot())
+  end
 
   -- A property's WriteCallback crosses as a handler id, as a command's does.
   function Ext.UI.RegisterType(name, properties, wrappedContext)
@@ -12155,7 +12990,37 @@ if Ext._Internal.IsClientState() then
     return args.Handled == true
   end
 
+  -- Upstream's Ext.UI.Defer: fn runs on the UI thread before its next
+  -- update, each in a proxy scope of its own.
+  local deferred = {}
+  function Ext.UI.Defer(fn)
+    if type(fn) ~= "function" then
+      error("bad argument #1 to 'Defer' (function expected, got " .. type(fn) .. ")", 2)
+    end
+    deferred[#deferred + 1] = fn
+    I.UiDeferPending()
+  end
+
+  function Ext._Internal.UiRunDeferred()
+    if #deferred == 0 then return end
+    local batch = deferred
+    deferred = {}
+    in_deferred = true
+    for _, fn in ipairs(batch) do
+      generation = generation + 1
+      local ok, err = xpcall(fn, debug.traceback)
+      if not ok then
+        Ext.Log.PrintError("Error while running a deferred UI callback: " .. tostring(err))
+      end
+    end
+    in_deferred = false
+    generation = generation + 1
+  end
+
   function Ext._Internal.UiPump()
+    generation = generation + 1
+    -- Without the View::Update hook there is no UI-thread pass to run them in.
+    if not I.UiThreadPump() then Ext._Internal.UiRunDeferred() end
     while true do
       local id, command, parameter = I.UiTakeCommand()
       if id == nil then break end
@@ -12294,8 +13159,14 @@ local function add_timer(ms, fn, repeat_ms, realtime)
   next_handle = handle + 1
   if realtime then handle = handle | REALTIME_FLAG end
 
+  -- Upstream clamps a NaN or negative delay to 0, and a repeat of 0 is one-shot.
+  ms = tonumber(ms) or 0
+  if ms ~= ms or ms < 0 then ms = 0 end
+  repeat_ms = tonumber(repeat_ms)
+  if repeat_ms ~= nil and (repeat_ms ~= repeat_ms or repeat_ms <= 0) then repeat_ms = nil end
+
   timers[handle] = {
-    due = clock.ms + (ms or 0),
+    due = clock.ms + ms,
     fn = fn,
     every = repeat_ms,
     paused = false,
@@ -12533,7 +13404,14 @@ function Ext._Internal.RunTimers()
   for _, handle in ipairs(due) do
     local t = timers[handle]
     if t ~= nil then
-      if t.every then t.due = now + t.every else timers[handle] = nil end
+      if t.every then
+        -- Upstream steps from the scheduled time, so repeats do not drift,
+        -- and catches up to now when it fell more than two periods behind.
+        t.due = t.due + t.every
+        if t.due < now - 2 * t.every then t.due = now end
+      else
+        timers[handle] = nil
+      end
       local ok, err = xpcall(t.fn, debug.traceback, handle)
       if not ok then
         Ext.Log.PrintError("Error while dispatching user function call: "
@@ -12656,7 +13534,7 @@ function Ext._Internal.ResizedList(current, n, i, v)
     if j ~= i then
       -- A struct element as a plain table, refilled after the resize.
       local element = current(j)
-      if Ext._Internal.Walkable(element) then element = Ext.Types.Serialize(element) end
+      if Ext._Internal.Walkable(element) then element = Ext._Internal.DeepPlain(element) end
       list[#list + 1] = element
     end
   end
@@ -12749,7 +13627,7 @@ read_path = function(handle, comp, path)
       return nil
     end
     local class = Ext._Internal.PointeeClass(comp, path, false)
-    if class == nil then return read_path(handle, comp, path .. "[0]") end
+    if class == nil then return Ext._Internal.MarkPointer(read_path(handle, comp, path .. "[0]")) end
     return Ext._Internal.PointedObject(target, class)
   end
 
@@ -12761,10 +13639,19 @@ read_path = function(handle, comp, path)
   return value
 end
 
--- An array index as upstream reads it, with lua_tointeger: "2" and 2.0 are 2.
-function Ext._Internal.ArrayIndex(i)
+-- An array index as upstream reads it, with get<int> (luaL_checkinteger): "2"
+-- and 2.0 are 2, and anything else raises.
+-- luaL_checkinteger's errors as upstream's array proxy raises them, named for
+-- the metamethod running: "__index", or "__newindex" for a write.
+function Ext._Internal.ArrayIndex(i, event)
   local n = tonumber(i)
-  return n ~= nil and math.tointeger(n) or i
+  local index = n ~= nil and math.tointeger(n) or nil
+  if index == nil then
+    event = event or "__index"
+    if n ~= nil then error("bad argument #2 to '" .. event .. "' (number has no integer representation)", 3) end
+    error("bad argument #2 to '" .. event .. "' (number expected, got " .. type(i) .. ")", 3)
+  end
+  return index
 end
 
 make_array = function(handle, comp, path)
@@ -12805,9 +13692,22 @@ make_array = function(handle, comp, path)
       return element(i)
     end,
     __newindex = function(_, i, v)
-      i = Ext._Internal.ArrayIndex(i)
+      i = Ext._Internal.ArrayIndex(i, "__newindex")
       local n = length()
       local ok, err
+      -- Upstream's ordered erase and push_back, in place where the array has them:
+      -- the other elements keep everything they hold.
+      if type(i) == "number" and v == nil and i >= 1 and i <= n
+         and Ext._Internal.ArrayErase(handle, comp, path, i - 1) then
+        return
+      end
+      if type(i) == "number" and i == n + 1 and v ~= nil and Ext._Internal.ArrayErase(handle, comp, path) then
+        local copied = Ext._Internal.PlainValue(v)
+        if Ext._Internal.FillInto(element(i), copied, true) then return end
+        ok, err = Ext._Internal.SetField(handle, comp, element_path(i), copied)
+        if not ok then error("bg3le: " .. tostring(err), 0) end
+        return
+      end
       if type(i) == "number" and ((v == nil and i >= 1 and i <= n) or i == n + 1) then
         local list = Ext._Internal.ResizedList(element, n, i, v)
         ok, err = Ext._Internal.SetField(handle, comp, path, list)
@@ -12822,7 +13722,9 @@ make_array = function(handle, comp, path)
       elseif type(i) == "number" and (i < 1 or i > n) then
         return  -- upstream's SetElement refuses it, and its __newindex ignores that
       else
-        ok, err = Ext._Internal.SetField(handle, comp, element_path(i), v)
+        local copied = Ext._Internal.PlainValue(v)
+        if Ext._Internal.FillInto(element(i), copied, copied ~= v) then return end
+        ok, err = Ext._Internal.SetField(handle, comp, element_path(i), copied)
       end
       if not ok then error("bg3le: " .. tostring(err), 0) end
     end,
@@ -12887,6 +13789,13 @@ make_map = function(handle, comp, path)
     __bg3leIdentity = function()
       return "c:" .. handle .. ":" .. comp .. ":" .. path
     end,
+    __bg3leFind = function(same)
+      local legacy = (Ext._Internal.TypeNameAt(comp, path) or ""):find("Legacy") ~= nil
+      for i = 0, count() - 1 do
+        if same(value_at(i)) then return legacy and key_at(i) or i + 1 end
+      end
+      return nil
+    end,
     __index = function(_, key)
       -- A method rather than a field, so a map whose keys cannot be converted
       -- is still walkable.
@@ -12907,6 +13816,20 @@ make_map = function(handle, comp, path)
     -- table for a struct value is a default value filled from it, replacing
     -- any existing one, as upstream's get<TValue> and insert make it.
     __newindex = function(_, key, value)
+      local copied = Ext._Internal.PlainValue(value)
+      -- Part of a proxy's copy: an existing value is filled where it is.
+      if Ext._Internal.CopyMode and type(copied) == "table" then
+        local at = slot_of(key)
+        local cur = at ~= nil and value_at(at) or nil
+        if cur ~= nil and (Ext._Internal.CopyInPlace(cur, copied) or Ext._Internal.FillInto(cur, copied, true)) then
+          return
+        end
+      end
+      if copied ~= value and Ext._Internal.FieldInfo(comp, path .. "[0]") ~= "struct" then
+        local at = slot_of(key)
+        if at ~= nil and Ext._Internal.FillInto(value_at(at), copied, false) then return end
+      end
+      value = copied
       local i = slot_of(key)
       if value == nil then
         if i ~= nil then
@@ -12991,6 +13914,179 @@ local function type_of_view(comp, prefix)
   return name
 end
 
+-- A field write through fn(...), its argument errors worded as upstream's
+-- luaL_checkinteger and friends word them inside __newindex.
+function Ext._Internal.ProxySet(fn, ...)
+  local called, ok, err = pcall(fn, ...)
+  if not called then
+    if type(ok) == "string" then
+      ok = ok:gsub("bad argument #%d+ to '[^']*'", "bad argument #3 to '__newindex'", 1)
+    end
+    Ext._Internal.Reraise(ok)
+  end
+  return ok, err
+end
+
+-- An error caught inside the prelude, raised again for the caller: one the
+-- prelude's own code raised gets the caller's position instead of its own.
+function Ext._Internal.Reraise(err)
+  if type(err) == "string" and err:find("^bg3le prelude:%d+: ") then
+    Ext._Internal.RaiseOutside((err:gsub("^bg3le prelude:%d+: ", "")))
+  end
+  error(err, 0)
+end
+
+-- As Reraise, positioning an unpositioned message as error(err, level) would.
+function Ext._Internal.ReraiseAt(err, level)
+  if type(err) == "string" and not err:find("^[^\n]-:%d+: ") then error(err, level + 1) end
+  Ext._Internal.Reraise(err)
+end
+
+-- A refused write, as upstream's LightObjectProxyMetatable::NewIndex reports it.
+-- What bg3le itself cannot write keeps bg3le's own wording.
+function Ext._Internal.ProxySetFailed(view, key, err)
+  local why = tostring(err)
+  local what = nil
+  if why:find("does not resolve", 1, true) then
+    what = "property does not exist"
+  elseif why:find("is read-only", 1, true) then
+    what = "property is read-only"
+  elseif why:find("(UnsupportedType)", 1, true) then
+    what = "cannot write properties of this type"
+  end
+  if what == nil then Ext._Internal.RaiseOutside("bg3le: " .. why) end
+  Ext._Internal.RaiseOutside(string.format("Cannot set property %s::%s - %s",
+                                           tostring(view), tostring(key), what))
+end
+
+-- Upstream's map Unserialize clears the map and adds each entry. The same end
+-- state, reached without removing what stays: the wanted entries are written,
+-- then the keys not among them removed. A key bg3le cannot read cannot be
+-- compared or removed, so such a map is refused before anything changes.
+do
+  local function key_id(k)
+    local handle = Ext._Internal.EntityProxyHandle(k)
+    if handle ~= nil then return "\0e" .. handle end
+    local label = Ext._Internal.EnumLabelOf(k)
+    if label ~= nil then return label end
+    return k
+  end
+  function Ext._Internal.RefillMap(map, values)
+    local current = {}
+    for k in pairs(map) do
+      if type(k) == "string" and k:sub(1, 1) == "<" and k:find("^<unreadable key") then
+        error("bg3le: this map has keys bg3le cannot read, so it cannot be replaced", 0)
+      end
+      current[#current + 1] = k
+    end
+    local wanted = {}
+    for k, v in pairs(values) do
+      wanted[key_id(k)] = true
+      map[k] = v
+    end
+    for _, k in ipairs(current) do
+      if not wanted[key_id(k)] then map[k] = nil end
+    end
+  end
+end
+
+-- A whole container or struct assigned, as upstream's setter Unserializes it from
+-- a table or from a proxy of the same kind: a map is refilled, a struct filled
+-- from the other's fields. An array or set comes back as a table for the
+-- caller's own table path. Returns whether it was handled, and the value to use.
+function Ext._Internal.AssignWhole(view, key, value)
+  local copied = Ext._Internal.PlainValue(value)
+  if type(copied) ~= "table" then return false, value end
+  local ok, cur = pcall(function() return view[key] end)
+  if not ok then return false, copied end
+  -- A pointer member is upstream's UnsupportedType, which the setter reports.
+  if Ext._Internal.PointerView(cur) then return false, value end
+  -- A proxy copied over an array of its length: in place, as upstream copy-assigns
+  -- from userdata, so what a table cannot carry (a hidden member, a variant's
+  -- type) is kept rather than reset by a resize. The writes nested in that copy
+  -- (a map's values, an element's own containers) are part of it.
+  local copying = copied ~= value or Ext._Internal.CopyMode
+  if not copying then
+    return Ext._Internal.FillInto(cur, copied, false), copied
+  end
+  -- A set copied over one holding the same keys changes nothing; bg3le cannot
+  -- hash every key type to rebuild one.
+  local cm = Ext._Internal.RawGetMetatable(cur)
+  if type(cm) == "table" and cm.__bg3leSetAt ~= nil
+     and Ext._Internal.SameValue(Ext._Internal.DeepPlain(cur), copied) then
+    return true, copied
+  end
+  local outer = Ext._Internal.CopyMode
+  Ext._Internal.CopyMode = true
+  local okc, done = pcall(function()
+    return Ext._Internal.CopyInPlace(cur, copied) or Ext._Internal.FillInto(cur, copied, true)
+  end)
+  Ext._Internal.CopyMode = outer
+  if not okc then Ext._Internal.Reraise(done) end
+  return done, copied
+end
+
+-- Plain values deep-equal.
+function Ext._Internal.SameValue(a, b)
+  if type(a) ~= "table" or type(b) ~= "table" then return a == b end
+  for k, v in pairs(a) do
+    if not Ext._Internal.SameValue(v, b[k]) then return false end
+  end
+  for k in pairs(b) do
+    if a[k] == nil then return false end
+  end
+  return true
+end
+
+-- An array of the same length, element by element in place, nested arrays
+-- included; false when cur is not one (or holds pointers), for the caller's path.
+function Ext._Internal.CopyInPlace(cur, values)
+  local meta = Ext._Internal.RawGetMetatable(cur)
+  if type(values) ~= "table" or type(meta) ~= "table" or meta.__bg3leContainer ~= "array"
+     or meta.__bg3leSetAt ~= nil or #cur ~= #values or Ext._Internal.HoldsPointers(cur) then
+    return false
+  end
+  for i = 1, #values do
+    local el = cur[i]
+    if not (Ext._Internal.CopyInPlace(el, values[i]) or Ext._Internal.FillInto(el, values[i], true)) then
+      cur[i] = values[i]
+    end
+  end
+  return true
+end
+
+-- A container or struct proxy as the plain table upstream copies it from
+-- (Unserialize from userdata); anything else, an entity or enum value
+-- included, as it is.
+function Ext._Internal.PlainValue(value)
+  if type(value) ~= "userdata" or Ext._Internal.EntityProxyHandle(value) ~= nil
+     or Ext._Internal.EnumLabelOf(value) ~= nil or Ext._Internal.BitfieldOf(value) ~= nil then
+    return value
+  end
+  local meta = Ext._Internal.RawGetMetatable(value)
+  if type(meta) ~= "table" or meta.__pairs == nil then return value end
+  return Ext._Internal.DeepPlain(value)
+end
+
+-- A table into an existing slot: a map is refilled and, when struct is set, a
+-- struct filled. False when the caller's own path should take the table.
+function Ext._Internal.FillInto(cur, values, struct)
+  if type(values) ~= "table" or type(cur) ~= "userdata" then return false end
+  local meta = Ext._Internal.RawGetMetatable(cur)
+  if type(meta) ~= "table" or meta.__pairs == nil then return false end
+  if meta.__bg3leContainer == "map" then
+    -- A map of pointers is left to the setter, which refuses it as upstream's.
+    if Ext._Internal.HoldsPointers(cur) then return false end
+    Ext._Internal.RefillMap(cur, values)
+    return true
+  end
+  if struct and meta.__bg3leContainer == nil and meta.__bg3leIdentity ~= nil then
+    Ext.Types.Unserialize(cur, values)
+    return true
+  end
+  return false
+end
+
 make_fields = function(handle, comp, prefix, fields, identity)
   local function path_to(key)
     if prefix == "" then return key end
@@ -13025,8 +14121,9 @@ make_fields = function(handle, comp, prefix, fields, identity)
           if type(flag) == "boolean" then return flag end
         end
 
-        local where = prefix == "" and comp or (comp .. "." .. prefix)
-        error("bg3le: " .. where .. " has no field " .. tostring(key), 0)
+        Ext._Internal.RaiseOutside(string.format(
+          "Property does not exist: %s::%s - property does not exist",
+          type_of_view(comp, prefix) or comp, tostring(key)))
       end
       -- The field table says which kind it is, but read_path asks again
       -- about the field's own path. Both agree; going through the one
@@ -13039,23 +14136,29 @@ make_fields = function(handle, comp, prefix, fields, identity)
                                                  key)
         if extra ~= nil then
           if extra.Set == nil then
-            error("bg3le: " .. tostring(key) .. " is read-only", 0)
+            Ext._Internal.ProxySetFailed(type_of_view(comp, prefix) or comp, key, "is read-only")
           end
           extra.Set(self, value)
           return
         end
       end
 
+      if type(value) == "table" or type(value) == "userdata" then
+        local handled
+        handled, value = Ext._Internal.AssignWhole(self, key, value)
+        if handled then return end
+      end
+
       local path = path_to(key)
-      local ok, err = Ext._Internal.SetField(handle, comp, path, value)
+      local ok, err = Ext._Internal.ProxySet(Ext._Internal.SetField, handle, comp, path, value)
       -- A hash set is the one field a plain write refuses on purpose: its
       -- keys cannot be written in place. A table is the whole set.
       if not ok and type(value) == "table" and tostring(err):find("is read-only", 1, true) then
-        ok, err = Ext._Internal.SetSet(handle, comp, path, value)
+        ok, err = Ext._Internal.ProxySet(Ext._Internal.SetSet, handle, comp, path, value)
       elseif ok and type(value) == "table" and value[1] ~= nil then
         Ext._Internal.FillStructElements(self[key], value)
       end
-      if not ok then error("bg3le: " .. tostring(err), 0) end
+      if not ok then Ext._Internal.ProxySetFailed(type_of_view(comp, prefix) or comp, key, err) end
     end,
     -- Iterating yields field names and their values, so dumping a component
     -- shows what it holds. A field of a kind bg3le cannot convert yields the
@@ -13116,7 +14219,9 @@ end
 
 local entity_methods = {}
 
+-- Component names are upstream's ExtComponentType, so an unknown one raises.
 function entity_methods:GetComponent(name)
+  name = Ext._Internal.EnumArg("ExtComponentType", name, 2, 2)
   return get_component(handle_of(self), name)
 end
 
@@ -13168,14 +14273,17 @@ function entity_methods:GetChangedComponents()
 end
 
 function entity_methods:MarkChanged(name)
+  name = Ext._Internal.EnumArg("ExtComponentType", name, 2, 2)
   return Ext._Internal.MarkChanged(handle_of(self), name) == true
 end
 
 function entity_methods:WasChanged(name)
+  name = Ext._Internal.EnumArg("ExtComponentType", name, 2, 2)
   return Ext._Internal.EntityWasChanged(handle_of(self), name)
 end
 
 function entity_methods:GetReplicationFlags(name, qword)
+  name = Ext._Internal.EnumArg("ExtComponentType", name, 2, 2)
   return Ext._Internal.EntityReplicationFlags(handle_of(self), name,
                                               qword)
 end
@@ -13189,60 +14297,67 @@ local function replicate(entity, name, flags, qword)
 end
 
 function entity_methods:SetReplicationFlags(name, flags, qword)
+  name = Ext._Internal.EnumArg("ExtComponentType", name, 2, 2)
   replicate(self, name, flags, qword or 0)
 end
 
 function entity_methods:Replicate(name)
+  name = Ext._Internal.EnumArg("ExtComponentType", name, 2, 2)
   replicate(self, name, nil, 0)
 end
 
 -- OnCreate(component, fn[, deferred[, once]]) and its fixed variants, as
 -- Ext.Entity's with this entity.
-local function entity_on(kind, deferredKind)
+local function entity_on(kind, deferredKind, fname)
   return function(self, component, handler, deferred, once)
     return Ext._Internal.SubscribeEntity(deferred and deferredKind or kind,
-                                         component, handler, self, once == true)
+                                         component, handler, self, once == true, nil, 2, fname)
   end
 end
 
-local function entity_on_fixed(kind, once)
+local function entity_on_fixed(kind, once, fname)
   return function(self, component, handler)
-    return Ext._Internal.SubscribeEntity(kind, component, handler, self, once)
+    return Ext._Internal.SubscribeEntity(kind, component, handler, self, once, nil, 2, fname)
   end
 end
 
-entity_methods.OnCreate = entity_on("create", "create-deferred")
-entity_methods.OnCreateDeferred = entity_on_fixed("create-deferred", false)
-entity_methods.OnCreateDeferredOnce = entity_on_fixed("create-deferred", true)
-entity_methods.OnCreateOnce = entity_on_fixed("create", true)
-entity_methods.OnDestroy = entity_on("destroy", "destroy-deferred")
-entity_methods.OnDestroyDeferred = entity_on_fixed("destroy-deferred", false)
-entity_methods.OnDestroyDeferredOnce = entity_on_fixed("destroy-deferred", true)
-entity_methods.OnDestroyOnce = entity_on_fixed("destroy", true)
+entity_methods.OnCreate = entity_on("create", "create-deferred", "OnCreate")
+entity_methods.OnCreateDeferred = entity_on_fixed("create-deferred", false, "OnCreateDeferred")
+entity_methods.OnCreateDeferredOnce = entity_on_fixed("create-deferred", true, "OnCreateDeferredOnce")
+entity_methods.OnCreateOnce = entity_on_fixed("create", true, "OnCreateOnce")
+entity_methods.OnDestroy = entity_on("destroy", "destroy-deferred", "OnDestroy")
+entity_methods.OnDestroyDeferred = entity_on_fixed("destroy-deferred", false, "OnDestroyDeferred")
+entity_methods.OnDestroyDeferredOnce = entity_on_fixed("destroy-deferred", true, "OnDestroyDeferredOnce")
+entity_methods.OnDestroyOnce = entity_on_fixed("destroy", true, "OnDestroyOnce")
 
 function entity_methods:OnChanged(component, handler, flags)
   return Ext._Internal.SubscribeEntity("change", component, handler, self,
-                                       false, flags)
+                                       false, flags, 2, "OnChanged")
 end
 
 -- Upstream's component edits and current-frame queries, through the
 -- calling thread's entity command buffer or the immediate cache.
 do
   local function create(self, name, immediate)
-    local addr, class = Ext._Internal.EntityComponentAdd(handle_of(self), tostring(name), immediate)
+    name = Ext._Internal.EnumArg("ExtComponentType", name, 2, 3)
+    local addr, class = Ext._Internal.EntityComponentAdd(handle_of(self), name, immediate)
     if addr == nil then
       Ext.Log.PrintError("Unable to construct components of this type: " .. tostring(name))
       return nil
     end
-    return Ext._Internal.PointedObject(addr, class)
+    local component = Ext._Internal.PointedObject(addr, class)
+    if immediate then Ext._Internal.ImmediateCreated(self, name, component) end
+    return component
   end
   function entity_methods:CreateComponent(name) return create(self, name, false) end
   function entity_methods:CreateComponentImmediate(name) return create(self, name, true) end
   function entity_methods:RemoveComponent(name)
-    return Ext._Internal.EntityComponentRemove(handle_of(self), tostring(name), false)
+    name = Ext._Internal.EnumArg("ExtComponentType", name, 2, 2)
+    return Ext._Internal.EntityComponentRemove(handle_of(self), name, false)
   end
   function entity_methods:RemoveComponentImmediate(name)
-    return Ext._Internal.EntityComponentRemove(handle_of(self), tostring(name), true)
+    name = Ext._Internal.EnumArg("ExtComponentType", name, 2, 2)
+    return Ext._Internal.EntityComponentRemove(handle_of(self), name, true)
   end
 
   -- The first change of that type decides, as upstream's loop does.
@@ -13253,10 +14368,14 @@ do
     return nil
   end
   function entity_methods:WasAdded(name)
+    name = Ext._Internal.EnumArg("ExtComponentType", name, 2, 2)
     local c = change_of(self, name)
     return c ~= nil and c ~= false
   end
-  function entity_methods:WasRemoved(name) return change_of(self, name) == false end
+  function entity_methods:WasRemoved(name)
+    name = Ext._Internal.EnumArg("ExtComponentType", name, 2, 2)
+    return change_of(self, name) == false
+  end
 
   -- ecs::EntityChangeFlags: Create 1, Destroy 2.
   local function has_flag(self, bit)
@@ -13371,7 +14490,12 @@ local entity_meta = {
   -- "Entity (%016llx)", which is what the captured entity-host reference
   -- prints; bg3le printed "table: 0x...".
   __tostring = function(entity)
-    return string.format("Entity (%016x)", handle_of(entity))
+    local handle = handle_of(entity)
+    -- " [DEAD]" for one no longer alive, as upstream's since v33.
+    if not Ext._Internal.EntityAlive(handle) then
+      return string.format("Entity (%016x) [DEAD]", handle)
+    end
+    return string.format("Entity (%016x)", handle)
   end,
   -- What Ext.Types.GetObjectType reports, as upstream's GetTypeName does.
   __name = "EntityProxy",
@@ -13416,6 +14540,7 @@ function Ext.Entity.Get(id)
   if t == "nil" then return nil end
   local handle
   if t == "string" then
+    Ext._Internal.CheckGuid(id, 1, 2)
     handle = Ext._Internal.UuidToHandle(id)
   elseif t == "number" then
     handle = Ext._Internal.NetIdEntity(id)
@@ -13492,6 +14617,12 @@ local function make_mod(addr)
     ModConflicts = descs(1),
     Addons = descs(2),
   }
+  local standIns = Ext._Internal.StandIns
+  standIns[mod], standIns[mod.Info] = true, true
+  for _, list in ipairs({mod.Dependencies, mod.ModConflicts, mod.Addons}) do
+    standIns[list] = true
+    for _, desc in ipairs(list) do standIns[desc] = true end
+  end
   mods_by_addr[addr] = mod
   return mod
 end
@@ -13584,17 +14715,22 @@ end
 local mod_loaded = {}
 local mod_loaded_for = -1
 
+-- The loose mods bg3le bootstrapped: not in any load order, but their scripts
+-- run, so they are loaded for their own lookups.
+Ext._Internal.LooseMods = {}
+
 function Ext.Mod.IsModLoaded(uuid)
   if type(uuid) ~= "string" then return false end
+  if Ext._Internal.LooseMods[string.lower(uuid)] then return true end
 
   local order = current_load_order()
   if #order ~= mod_loaded_for then
     mod_loaded = {}
     mod_loaded_for = #order
-    for _, id in ipairs(order) do mod_loaded[id] = true end
+    for _, id in ipairs(order) do mod_loaded[string.lower(id)] = true end
   end
 
-  return mod_loaded[uuid] == true
+  return mod_loaded[string.lower(uuid)] == true
 end
 
 -- Every mod the engine has a Module for, by uuid, whether or not it made
@@ -13803,6 +14939,51 @@ do
     end
     return out
   end
+
+  -- A StatsFunctorId from its label or its number.
+  function Ext._Internal.FunctorIdValue(functorType)
+    local value = functorType
+    if type(functorType) == "string" then
+      value = nil
+      for k, label in pairs(Ext.Enums.StatsFunctorId) do
+        if type(k) == "number" and label == functorType then value = k end
+      end
+    end
+    return math.tointeger(value)
+  end
+
+  -- Upstream's FunctorGroup:AddNew and :Remove since v33, on the group's own
+  -- set; the group's list is kept in step. addresses maps a listed functor to
+  -- the engine object behind it.
+  function Ext._Internal.FunctorGroupMethods(set, functors, addresses)
+    return {
+      AddNew = function(_, functorType)
+        local label = Ext._Internal.EnumArg("StatsFunctorId", functorType, 2, 2)
+        local value = Ext._Internal.FunctorIdValue(label)
+        local at, cls = Ext._Internal.FunctorsAdd(set, value)
+        if at == nil then
+          Ext.Log.PrintError("bg3le: FunctorGroup:AddNew(" .. tostring(functorType) .. "): " .. tostring(cls))
+          return nil
+        end
+        local f = read_functor(at, cls or "stats::Functor")
+        functors[#functors + 1] = f
+        addresses[f] = at
+        return f
+      end,
+      Remove = function(_, functor)
+        local at = addresses[functor]
+        if at == nil then error("bg3le: FunctorGroup:Remove expects a functor of this group", 2) end
+        local removed = Ext._Internal.FunctorsRemove(set, at)
+        if removed then
+          for i, f in ipairs(functors) do
+            if rawequal(f, functor) then table.remove(functors, i) break end
+          end
+          addresses[functor] = nil
+        end
+        return removed
+      end,
+    }
+  end
 end
 
 local function read_attribute(addr, i)
@@ -13854,8 +15035,9 @@ local function read_attribute(addr, i)
       value = Ext._Internal.StatsAttrLabel(addr, i, raw) or ""
     end
   elseif kind == 10 then
-    -- Object::Requirements, as upstream's serializer presents it.
+    -- Object::Requirements, as upstream's serializer presents it: the type an EnumValue.
     value = Ext._Internal.StatsRequirements(addr) or {}
+    for _, r in ipairs(value) do r.Requirement = Ext.Enums.RequirementType[r.Requirement] end
   elseif kind == 7 then
     -- Each group is a text key and a list of functors. A functor is a
     -- polymorphic engine object, and its concrete class is in the same
@@ -13868,11 +15050,17 @@ local function read_attribute(addr, i)
       local out = {}
       for gi, group in ipairs(groups) do
         local functors = {}
+        local addresses = setmetatable({}, {__mode = "k"})
         for fi, f in ipairs(group.Functors) do
           functors[fi] = read_functor(f.Address, f.Class)
+          addresses[functors[fi]] = f.Address
         end
-        out[gi] = {TextKey = group.TextKey, Functors = functors}
+        out[gi] = setmetatable({TextKey = group.TextKey, Functors = functors}, {
+          __index = Ext._Internal.FunctorGroupMethods(group.Set, functors, addresses),
+        })
+        Ext._Internal.StandIns[out[gi]], Ext._Internal.StandIns[functors] = true, true
       end
+      Ext._Internal.StandIns[out] = true
       value = out
     end
   elseif kind == 8 then
@@ -13979,7 +15167,13 @@ local function stat_write(self, key, value, raw)
   end
 
   local index, kind, typeName = Ext._Internal.StatsAttrFind(addr, key)
-  if index == nil then
+  if index == nil and not raw then
+    -- Upstream's LuaStatSetAttribute: logged, then NoSuchProperty.
+    Ext.Log.PrintError("Object '" .. tostring(rawget(self, "__name")) .. "' has no attribute named '"
+                       .. tostring(key) .. "'")
+    Ext._Internal.RaiseOutside("Cannot set property stats::Object::" .. tostring(key)
+                               .. " - property does not exist")
+  elseif index == nil then
     error(string.format(
       "bg3le: %s is not an attribute of this stat, so there is nothing to "
       .. "write", tostring(key)), 3)
@@ -14006,11 +15200,26 @@ local function stat_write(self, key, value, raw)
     end
     local name = rawget(self, "__name") or "?"
     if type(value) == "table" then
-      error(string.format("Cannot use table value for stat property %s of type StatsFunctors!", key), 3)
+      Ext.Log.PrintError(string.format("Cannot use table value for stat property %s of type StatsFunctors!", key))
     elseif value == nil then
       Ext.Log.PrintError("Temporarily disabled until functors are mapped")
     else
       Ext.Log.PrintError(string.format("Couldn't set %s.%s to string value: Inappropriate type: StatsFunctors", name, key))
+    end
+    return false
+  end
+
+  -- MemorizationRequirements is deprecated: upstream's TrySetValue logs why per
+  -- value type and fails.
+  if slot.kind == 11 and not raw then
+    local name, t = rawget(self, "__name") or "?", type(value)
+    if t == "nil" or t == "table" then
+      Ext.Log.PrintError(string.format("Cannot use %s value for stat property %s of type %s!", t, key, slot.typeName))
+    elseif t == "string" or t == "number" then
+      Ext.Log.PrintError(string.format("Couldn't set %s.%s to %s value: Inappropriate type: %s", name, key,
+                                       t == "string" and "string" or "integer", slot.typeName))
+    else
+      Ext.Log.PrintError(string.format("Lua property values of type '%s' are not supported", Ext.Types.GetValueType(value)))
     end
     return false
   end
@@ -14111,7 +15320,13 @@ local function stat_write(self, key, value, raw)
       end
     end
   elseif writable == "requirements" then
-    local ok, why = Ext._Internal.StatsRequirementsSet(addr, value or {})
+    -- Each type read as upstream's get<RequirementType>(L, -1) reads it.
+    local list = {}
+    for i, r in ipairs(value or {}) do
+      list[i] = {Requirement = Ext._Internal.EnumArg("RequirementType", r.Requirement, -1, 3),
+                 Not = r.Not, Param = r.Param}
+    end
+    local ok, why = Ext._Internal.StatsRequirementsSet(addr, list)
     if not ok then
       error(string.format("bg3le could not write %s: %s", key, why), 3)
     end
@@ -14247,7 +15462,10 @@ local STAT_METHODS = {
   SetRawAttribute = function(self, name, value)
     local ok, result = pcall(stat_write, self, name, value, true)
     if not ok then
-      Ext.Log.PrintError((tostring(result):gsub("^bg3le prelude:%d+: ", "")))
+      -- Logged as upstream logs it, without a position.
+      local msg, where = tostring(result), Ext._Internal.Where()
+      if where ~= "" and msg:sub(1, #where) == where then msg = msg:sub(#where + 1) end
+      Ext.Log.PrintError((msg:gsub("^bg3le prelude:%d+: ", "")))
       return false
     end
     return result
@@ -14349,15 +15567,33 @@ stat_proxy.__index = function(self, key)
 
   local addr = rawget(self, "__addr")
   local index = Ext._Internal.StatsAttrFind(addr, key)
-  if index == nil then return nil end
+  if index == nil then
+    Ext.Log.PrintError("Stat object '" .. tostring(rawget(self, "__name")) .. "' has no attribute named '"
+                       .. tostring(key) .. "'")
+    Ext._Internal.RaiseOutside("Property does not exist: stats::Object::" .. tostring(key) .. " - property does not exist")
+  end
 
   local _, value = read_attribute(addr, index)
   cache[key] = value == nil and STAT_NIL or value
   return value
 end
 
-stat_proxy.__newindex = function(self, key, value)
-  stat_write(self, key, value)
+-- As upstream's stats::Object property map: its own members are read-only,
+-- an attribute goes through LuaStatSetAttribute, and a refusal raises.
+do
+  local read_only = {
+    Name = true, ModifierListIndex = true, ModifierList = true, ModId = true, OriginalModId = true,
+    Using = true, Sync = true, SetPersistence = true, SetRawAttribute = true, CopyFrom = true,
+  }
+  stat_proxy.__newindex = function(self, key, value)
+    if read_only[key] then
+      Ext._Internal.RaiseOutside("Cannot set property stats::Object::" .. tostring(key) .. " - property is read-only")
+    end
+    if stat_write(self, key, value) == false then
+      Ext._Internal.RaiseOutside("Cannot set property stats::Object::" .. tostring(key)
+                                 .. " - cannot write properties of this type")
+    end
+  end
 end
 
 -- Enumerates methods alongside fields, which is what makes a dump match:
@@ -14514,13 +15750,14 @@ end
 
 -- write(k, v) takes an element write to the engine; assign(values), for
 -- Ext.Types.Unserialize, the whole container.
-local function snapshot_container(items, container, write, assign)
+local function snapshot_container(items, container, write, assign, find)
   return Ext._Internal.NewObjectProxy({
+    __bg3leFind = find,
     __bg3leContainer = container,
     __index = container == "array"
               and function(_, k) return items[Ext._Internal.ArrayIndex(k)] end or items,
     __newindex = function(_, k, v)
-      write(container == "array" and Ext._Internal.ArrayIndex(k) or k, v)
+      write(container == "array" and Ext._Internal.ArrayIndex(k, "__newindex") or k, v)
     end,
     __len = container == "map" and function() return entry_count(items) end
             or function() return #items end,
@@ -14556,8 +15793,8 @@ local function read_object_path(addr, class, path, kind)
     local pointee = Ext._Internal.PointeeClass(class, path, true)
     if pointee == nil then
       local element = path .. "[0]"
-      return read_object_path(addr, class, element,
-                              Ext._Internal.ObjectFieldInfo(class, element))
+      return Ext._Internal.MarkPointer(read_object_path(addr, class, element,
+                                                        Ext._Internal.ObjectFieldInfo(class, element)))
     end
     return Ext._Internal.PointedObject(target, pointee)
   end
@@ -14602,12 +15839,27 @@ local function read_object_path(addr, class, path, kind)
               .. " is out of range 1.." .. n, 0)
       end
       local ok, err
+      if v == nil and Ext._Internal.ObjectArrayErase(addr, class, path, k - 1) then
+        read_items(items)
+        return
+      end
+      if k == n + 1 and Ext._Internal.ObjectArrayErase(addr, class, path) then
+        read_items(items)
+        local copied = Ext._Internal.PlainValue(v)
+        if Ext._Internal.FillInto(items[k], copied, true) then return end
+        ok, err = Ext._Internal.ObjectSetField(addr, class, path .. "[" .. (k - 1) .. "]", copied)
+        if not ok then error("bg3le: " .. tostring(err), 0) end
+        read_items(items)
+        return
+      end
       if v == nil or k == n + 1 then
         ok, err = Ext._Internal.ObjectSetField(addr, class, path,
           Ext._Internal.ResizedList(function(j) return items[j] end, n, k, v))
       else
+        local copied = Ext._Internal.PlainValue(v)
+        if Ext._Internal.FillInto(items[k], copied, copied ~= v) then return end
         ok, err = Ext._Internal.ObjectSetField(addr, class,
-                                               path .. "[" .. (k - 1) .. "]", v)
+                                               path .. "[" .. (k - 1) .. "]", copied)
       end
       if not ok then error("bg3le: " .. tostring(err), 0) end
       read_items(items)
@@ -14652,6 +15904,17 @@ local function read_object_path(addr, class, path, kind)
     -- writes through, a new key is added, nil removes one, and a table for a
     -- struct value replaces it with a default value filled from the table.
     local function write(k, v)
+      local copied = Ext._Internal.PlainValue(v)
+      -- Part of a proxy's copy: an existing value is filled where it is.
+      if Ext._Internal.CopyMode and type(copied) == "table" and slots[k] ~= nil
+         and (Ext._Internal.CopyInPlace(items[k], copied) or Ext._Internal.FillInto(items[k], copied, true)) then
+        return
+      end
+      if copied ~= v and slots[k] ~= nil
+         and Ext._Internal.FillInto(items[k], copied, false) then
+        return
+      end
+      v = copied
       local i = slots[k]
       if v == nil then
         if i ~= nil then
@@ -14684,7 +15947,17 @@ local function read_object_path(addr, class, path, kind)
       items[k] = read_object_path(addr, class, element,
                                   Ext._Internal.ObjectFieldInfo(class, element))
     end
-    return snapshot_container(items, "map", write, nil)
+    local function find(same)
+      local legacy = (Ext._Internal.TypeNameAt(class, path, true) or ""):find("Legacy") ~= nil
+      local order, n = {}, 0
+      for k, i in pairs(slots) do order[i] = k; n = n + 1 end
+      for i = 0, n - 1 do
+        local k = order[i]
+        if k ~= nil and same(items[k]) then return legacy and k or i + 1 end
+      end
+      return nil
+    end
+    return snapshot_container(items, "map", write, nil, find)
   end
 
   local value, err = Ext._Internal.ObjectGetField(addr, class, path)
@@ -14729,11 +16002,6 @@ function read_object(addr, class, prefix, out)
     return held
   end
 
-  local function where()
-    if prefix == "" then return class end
-    return class .. "." .. prefix
-  end
-
   -- The type this view is of, for Ext.Types.GetObjectType and for the members
   -- a mod may have grafted on with Ext.Types.AddCustomFunction.
   local viewType = Ext._Internal.ViewTypeName(class, prefix, true)
@@ -14750,6 +16018,10 @@ function read_object(addr, class, prefix, out)
         if extra.Fn ~= nil then return extra.Fn end
         return extra.Get(self)
       end
+      if fields[key] == nil and values[key] == nil then
+        Ext._Internal.RaiseOutside("Property does not exist: " .. tostring(viewType) .. "::" .. tostring(key)
+                                   .. " - property does not exist")
+      end
       return nil
     end,
     __newindex = function(self, key, value)
@@ -14758,23 +16030,29 @@ function read_object(addr, class, prefix, out)
         local extra = Ext._Internal.CustomMember(viewType, key)
         if extra ~= nil then
           if extra.Set == nil then
-            error("bg3le: " .. tostring(key) .. " is read-only", 0)
+            Ext._Internal.ProxySetFailed(viewType, key, "is read-only")
           end
           extra.Set(self, value)
           return
         end
-        error("bg3le: " .. where() .. " has no field " .. tostring(key), 0)
+        Ext._Internal.ProxySetFailed(viewType, key, "does not resolve")
+      end
+
+      if type(value) == "table" or type(value) == "userdata" then
+        local handled
+        handled, value = Ext._Internal.AssignWhole(self, key, value)
+        if handled then return end
       end
 
       local path = (prefix == "") and key or (prefix .. "." .. key)
-      local ok, err2 = Ext._Internal.ObjectSetField(
+      local ok, err2 = Ext._Internal.ProxySet(Ext._Internal.ObjectSetField,
         addr, class, path, value, Ext._Internal.Unserializing == true)
       -- As on a component: a hash set refuses a plain write, and a table is
       -- the whole set.
       if not ok and type(value) == "table" and tostring(err2):find("is read-only", 1, true) then
-        ok, err2 = Ext._Internal.ObjectSetSet(addr, class, path, value)
+        ok, err2 = Ext._Internal.ProxySet(Ext._Internal.ObjectSetSet, addr, class, path, value)
       end
-      if not ok then error("bg3le: " .. tostring(err2), 0) end
+      if not ok then Ext._Internal.ProxySetFailed(viewType, key, err2) end
 
       -- Read back rather than storing what was asked for, so the view
       -- shows what the engine now holds.
@@ -14832,7 +16110,7 @@ end
 -- ReloadAllVisuals = true lands on the engine's object.
 Ext.System = setmetatable({}, {
   __index = function(_, name)
-    if type(name) ~= "string" then return nil end
+    name = Ext._Internal.EnumArg("ExtSystemType", name, 2, 2)
     local probe = Ext._Internal.SystemProbe(name)
     if probe == nil or not probe.Ok or probe.System == 0
        or Ext._Internal.ObjectFields(probe.Class, "") == nil then
@@ -14875,15 +16153,8 @@ function Ext._Internal.PointedObject(target, class)
         end
         Ext._Internal.AmendObject(loaded, "FunctorList", list)
         Ext._Internal.AmendObject(loaded, "AddNew", function(_, functorType)
-          local value = functorType
-          if type(functorType) == "string" then
-            value = nil
-            for k, label in pairs(Ext.Enums.StatsFunctorId) do
-              if type(k) == "number" and label == functorType then value = k end
-            end
-          end
-          value = math.tointeger(value)
-          if value == nil then error("bg3le: " .. tostring(functorType) .. " is not a StatsFunctorId", 2) end
+          local label = Ext._Internal.EnumArg("StatsFunctorId", functorType, 2, 2)
+          local value = Ext._Internal.FunctorIdValue(label)
           local at, cls = Ext._Internal.FunctorsAdd(target, value)
           if at == nil then
             Ext.Log.PrintError("bg3le: Functors:AddNew(" .. tostring(functorType) .. "): " .. tostring(cls))
@@ -14908,6 +16179,7 @@ function Ext._Internal.PointedObject(target, class)
     __pairs = function() return pairs(get()) end,
     __len = function() return #get() end,
     __bg3leIdentity = string.format("p:%x", target),
+    __bg3lePointer = true,
     -- Its type, as Ext.Types.GetObjectType reports upstream's.
     __name = Ext._Internal.ViewTypeName(class, ""),
   })
@@ -14939,21 +16211,148 @@ Ext._Internal.AmendObject = amend_object
 
 Ext.StaticData = {}
 
--- Ext.StaticData.Get(guid, type), where type is the resource class name such
--- as "ActionResource". Returns nil plus a reason, so a caller can tell "no
--- such GUID" from "no such resource type".
-function Ext.StaticData.Get(guid, resourceType)
-  if type(guid) ~= "string" or type(resourceType) ~= "string" then
-    return nil, "Ext.StaticData.Get takes a GUID string and a type name"
+-- Upstream's get<Guid>: a string whose last 36 characters parse.
+-- luaL_argerror on behalf of an API function, named as it was called; a method
+-- call counts its arguments after self. level is 2 when that function calls it.
+function Ext._Internal.ArgError(index, extramsg, level, name)
+  local ar = debug.getinfo(level, "n")
+  name = name or (ar and ar.name) or "?"
+  if ar and ar.namewhat == "method" then
+    index = index - 1
+    if index == 0 then
+      Ext._Internal.RaiseOutside(string.format("calling '%s' on bad self (%s)", name, extramsg))
+    end
+  end
+  Ext._Internal.RaiseOutside(string.format("bad argument #%d to '%s' (%s)", index, name, extramsg))
+end
+
+-- luaL_checklstring: a string, or a number as one.
+function Ext._Internal.CheckString(value, index, level, name)
+  local t = type(value)
+  if t == "number" then return tostring(value) end
+  if t ~= "string" then
+    Ext._Internal.ArgError(index, "string expected, got " .. Ext.Types.GetValueType(value), level + 1, name)
+  end
+  return value
+end
+
+-- luaL_checkinteger: an integer, or a number or string that is one.
+function Ext._Internal.CheckInteger(value, index, level, name)
+  local n = math.tointeger(value)
+  if n ~= nil then return n end
+  if tonumber(value) ~= nil then
+    Ext._Internal.ArgError(index, "number has no integer representation", level + 1, name)
+  end
+  Ext._Internal.ArgError(index, "number expected, got " .. Ext.Types.GetValueType(value), level + 1, name)
+end
+
+function Ext._Internal.CheckGuid(value, index, level)
+  value = Ext._Internal.CheckString(value, index, level + 1)
+  local tail = value:sub(-36)
+  if #value < 36 or not tail:match("^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$") then
+    Ext._Internal.RaiseOutside(string.format("Param %d: not a valid GUID value: '%s'", index, value))
+  end
+end
+
+-- Upstream's get_enum_value: a label, an index or an EnumValue of the enum, as its label.
+function Ext._Internal.EnumArg(enum, value, index, level)
+  local t = type(value)
+  local labels = Ext.Enums[enum]
+  if t == "string" then
+    if labels[value] == nil then
+      Ext._Internal.RaiseOutside(string.format("Param %d: not a valid '%s' enum label: %s", index, enum, value))
+    end
+    return value
+  elseif t == "number" then
+    local v = labels[value]
+    if v == nil then
+      -- Upstream formats it with %p, which MSVC prints as 16 hex digits.
+      local n = math.tointeger(value)
+      Ext._Internal.RaiseOutside(string.format("Param %d: not a valid '%s' enum index: %s", index, enum,
+                          n ~= nil and string.format("%016X", n) or tostring(value)))
+    end
+    return Ext._Internal.EnumLabelOf(v) or v
+  elseif t == "userdata" then
+    local label = Ext._Internal.EnumLabelOf(value)
+    if label == nil or labels[label] == nil or Ext.Types.GetValueType(value) ~= enum then
+      Ext._Internal.RaiseOutside(string.format("Param %d: expected a '%s' enum value, got %s", index, enum,
+                          Ext.Types.GetValueType(value)))
+    end
+    return label
+  end
+  Ext._Internal.RaiseOutside(string.format("Param %d: expected integer, string or enum label of type '%s' value, got %s",
+                      index, enum, Ext.Types.GetValueType(value)))
+end
+
+-- Upstream's get_bitfield_value: a label, a table of labels, a number of known
+-- bits or a BitfieldValue of the bitfield, as its number.
+do
+  local known = {}
+  local function info(bitfield)
+    local hit = known[bitfield]
+    if hit ~= nil then return hit end
+    hit = {labels = {}, allowed = 0}
+    local i = 0
+    while true do
+      local label, n = Ext._Internal.EnumValueAt(bitfield, i)
+      if label == nil then break end
+      hit.labels[label] = n
+      hit.allowed = hit.allowed | n
+      i = i + 1
+    end
+    known[bitfield] = hit
+    return hit
   end
 
-  local addr, err = Ext._Internal.ResourceGet(resourceType, guid)
-  if addr == nil then return nil, err end
+  function Ext._Internal.BitfieldArg(bitfield, value, index, level)
+    local bf, t = info(bitfield), type(value)
+    if t == "string" then
+      if bf.labels[value] == nil then
+        Ext._Internal.RaiseOutside(string.format("Param %d: not a valid '%s' bitfield value: %s", index, bitfield, value))
+      end
+      return bf.labels[value]
+    elseif t == "number" then
+      local n = math.tointeger(value) or 0
+      if n & ~bf.allowed ~= 0 then
+        Ext._Internal.RaiseOutside(string.format("Param %d: not a valid '%s' bitfield value: %016X", index, bitfield, n))
+      end
+      return n
+    elseif t == "table" then
+      local bits = 0
+      for _, label in pairs(value) do
+        if bf.labels[label] == nil then
+          Ext._Internal.RaiseOutside(string.format("Param %d: not a valid '%s' bitfield value: %s", index, bitfield, tostring(label)))
+        end
+        bits = bits | bf.labels[label]
+      end
+      return bits
+    elseif t == "userdata" then
+      local name, bits = Ext._Internal.BitfieldOf(value)
+      if name ~= bitfield then
+        Ext._Internal.RaiseOutside(string.format("Param %d: expected a '%s' bitfield value, got %s", index, bitfield,
+                            Ext.Types.GetValueType(value)))
+      end
+      return bits
+    end
+    Ext._Internal.RaiseOutside(string.format("Param %d: expected integer, string or table '%s' bitfield value, got %s",
+                        index, bitfield, Ext.Types.GetValueType(value)))
+  end
+end
+
+-- Ext.StaticData.Get(guid, type), where type is an ExtResourceManagerType
+-- such as "ActionResource"; nil when there is no such resource.
+function Ext.StaticData.Get(guid, resourceType)
+  Ext._Internal.CheckGuid(guid, 1, 2)
+  resourceType = Ext._Internal.EnumArg("ExtResourceManagerType", resourceType, 2, 2)
+
+  local addr = Ext._Internal.ResourceGet(resourceType, guid)
+  if addr == nil then return nil end
   return read_object(addr, resourceType, "", {})
 end
 
 -- Every GUID in a resource bank, so a type can be enumerated.
 function Ext.StaticData.GetAll(resourceType)
+  resourceType = Ext._Internal.EnumArg("ExtResourceManagerType", resourceType, 1, 2)
   return Ext._Internal.ResourceGuids(resourceType)
 end
 
@@ -15234,10 +16633,11 @@ local function load_mod_from(name, uuid, read, report, boot)
   -- reads the calling mod from the first part of the source.
   local script_dir = #name > 37 and name:sub(1, #name - 37) or name
   local function mod_require(path, second)
-    if second ~= nil then
+    local named = second ~= nil
+    if named then
       -- Ext.Require(mod, path): a file of that mod, as upstream's
       -- FileLoader includes it.
-      if path ~= uuid then
+      if uuid == nil or string.lower(tostring(path)) ~= string.lower(uuid) then
         local key = tostring(path) .. "/" .. tostring(second)
         if required[key] == nil then
           required[key] = table.pack(Ext.Utils.Include(path, second, env))
@@ -15252,14 +16652,28 @@ local function load_mod_from(name, uuid, read, report, boot)
       end
       return table.unpack(required[path], 1, required[path].n)
     end
-    if required[path] ~= nil then return table.unpack(required[path]) end
+    -- Upstream's FileLoader keys on the global ModuleUUID, which is only set
+    -- while a mod's bootstrap runs.
+    if not named and ModuleUUID == nil then Ext._Internal.RequireWithoutMod() end
+    if required[path] ~= nil then return table.unpack(required[path], 1, required[path].n) end
+    -- A file that will not load is logged and its empty result kept, as upstream's.
+    local results = table.pack()
     local text = read("Lua/" .. path)
     if not text then
-      error("bg3le: Ext.Require could not read " .. path, 0)
+      Ext.Log.PrintError("Script file could not be opened: Mods/" .. name .. "/ScriptExtender/Lua/" .. path)
+    else
+      local chunk, err = Ext._Internal.RawLoad(text, script_dir .. "/" .. path, "t", env)
+      if not chunk then
+        Ext.Log.PrintError("Failed to parse script: " .. tostring(err))
+      else
+        local ran = table.pack(xpcall(chunk, debug.traceback))
+        if ran[1] then
+          results = table.pack(table.unpack(ran, 2, ran.n))
+        else
+          Ext.Log.PrintError("Failed to execute script: " .. tostring(ran[2]))
+        end
+      end
     end
-    local chunk, err = Ext._Internal.RawLoad(text, script_dir .. "/" .. path, "t", env)
-    if not chunk then error(err, 0) end
-    local results = table.pack(chunk())
     required[path] = results
     return table.unpack(results, 1, results.n)
   end
@@ -15267,6 +16681,9 @@ local function load_mod_from(name, uuid, read, report, boot)
   -- Upstream's ModLoader:CreateModEnv.
   env = Mods[table_name]
   local ext = create_mod_ext(uuid, mod_require)
+  -- The global Ext.Require(uuid, path) shares this mod's cache, as upstream's
+  -- one FileLoader keys both forms on "<uuid>/<path>".
+  if uuid ~= nil then Ext._Internal.ModRequirers[string.lower(uuid)] = mod_require end
   local fields = {
     type = type, tostring = tostring, tonumber = tonumber, pairs = pairs,
     ipairs = ipairs, error = error, next = next,
@@ -15512,6 +16929,7 @@ function Ext._Internal.LoadModScripts(boot)
         local meta = read_file(root .. "/Mods/" .. name .. "/meta.lsx") or ""
         local uuid = string.match(meta,
           'id="UUID"%s+type="[%w]+"%s+value="([^"]+)"')
+        if uuid ~= nil then Ext._Internal.LooseMods[string.lower(uuid)] = true end
         load_mod_from(name, uuid,
           function(path) return read_file(dir .. "/" .. path) end, nil, boot)
       end
@@ -15677,7 +17095,7 @@ do
   -- Errors point at the caller, as upstream's do, not at this file.
   local function forward(fn, ...)
     local ok, err = pcall(fn, ...)
-    if not ok then error((tostring(err):gsub("^bg3le prelude:%d+: ", "")), 3) end
+    if not ok then Ext._Internal.Reraise(err) end
   end
   function Ext.Stats.TreasureTable.Update(tbl)
     if type(tbl) ~= "table" then error("Ext.Stats.TreasureTable.Update expects a table", 2) end
@@ -15882,15 +17300,9 @@ do
   end
 
   function Ext.Stats.PrepareFunctorParams(contextType)
-    local value = contextType
-    if type(contextType) == "string" then
-      value = nil
-      for k, label in pairs(Ext.Enums.FunctorContextType) do
-        if type(k) == "number" and label == contextType then value = k end
-      end
-    end
-    value = math.tointeger(value)
-    local at = value and CONTEXT_CLASS[value] and Ext._Internal.FunctorParams(value)
+    local label = Ext._Internal.EnumArg("FunctorContextType", contextType, 1, 2)
+    local value = Ext.Enums.FunctorContextType[label].Value
+    local at = CONTEXT_CLASS[value] and Ext._Internal.FunctorParams(value)
     if at == nil then error("Unsupported context type", 2) end
     return live_view(at, CONTEXT_CLASS[value])
   end
@@ -15977,19 +17389,37 @@ local COMPONENT_EVENT_KINDS = {
   ["destroy"] = true, ["destroy-deferred"] = true,
 }
 
-local function subscribe(kind, component, handler, entity, once, flags)
+-- Arguments as upstream reads them: the component as an ExtComponentType at
+-- argIndex (2 for an entity method), then the handler (luaL_checktype's message).
+function Ext._Internal.CheckHandler(handler, fname)
   if type(handler) ~= "function" then
-    error("Ext.Entity subscriptions expect a handler function", 3)
+    Ext._Internal.RaiseOutside(string.format("bad argument #2 to '%s' (function expected, got %s)",
+                                             fname, Ext.Types.GetValueType(handler)))
   end
-  -- Under upstream's name, which is what events are delivered under.
-  if type(component) == "string" and COMPONENT_EVENT_KINDS[kind] then
-    component = Ext._Internal.ComponentShortName(component) or component
-    Ext._Internal.WatchComponentEvents(component)
-  elseif type(component) == "string" and kind == "change" then
-    component = Ext._Internal.ComponentShortName(component) or component
+end
+
+-- Types whose watch failed for want of a world, tried again each delivery.
+Ext._Internal.Unwatched = {}
+
+local function subscribe(kind, component, handler, entity, once, flags, argIndex, fname)
+  component = Ext._Internal.EnumArg("ExtComponentType", component, argIndex or 1, 3)
+  Ext._Internal.CheckHandler(handler, fname or "Subscribe")
+  if COMPONENT_EVENT_KINDS[kind] then
+    local watched, oneFrame = Ext._Internal.WatchComponentEvents(component)
+    if watched == nil then
+      Ext._Internal.RaiseOutside("No events are available for components of type " .. component)
+    end
+    if oneFrame and kind:find("^destroy") then
+      Ext._Internal.RaiseOutside("Destroy events are not available for one-frame components (" .. component .. ")")
+    end
+    if oneFrame and kind == "create" then
+      kind = "create-deferred"
+      Ext.Log.PrintWarning("Only deferred create events are available for one-frame components (" .. component .. ")")
+    end
+    if not watched then Ext._Internal.Unwatched[component] = true end
+  elseif kind == "change" then
     if not Ext._Internal.WatchReplication(component) then
-      error("No replication events are available for components of type "
-            .. component, 3)
+      Ext._Internal.RaiseOutside("No replication events are available for components of type " .. component)
     end
   end
   local id = next_sub
@@ -16007,16 +17437,42 @@ end
 -- callback; bg3le delivers both kinds here, the immediate ones first, since
 -- its Lua states may only be entered from their own thread. A destroyed
 -- component can no longer be read by then, so its handler gets nil for it.
+-- An immediate add runs the type's OnConstruct callbacks there and then, as
+-- upstream's since v33: its OnCreate handlers fire before the add returns,
+-- its deferred ones with the next delivery, and the queued copy is dropped.
+do
+  local created, deferred = {}, {}
+  function Ext._Internal.ImmediateCreated(entity, name, component)
+    created[tostring(Ext._Internal.EntityProxyHandle(entity)) .. "/" .. name] = true
+    deferred[#deferred + 1] = {entity, name}
+    Ext._Internal.FireEntityEvent("create", name, entity, component)
+  end
+  function Ext._Internal.TakeImmediateCreated()
+    local c, d = created, deferred
+    created, deferred = {}, {}
+    return c, d
+  end
+end
+
 function Ext._Internal.DeliverComponentEvents()
+  local unwatched = Ext._Internal.Unwatched
+  for component in pairs(unwatched) do
+    if Ext._Internal.WatchComponentEvents(component) then unwatched[component] = nil end
+  end
+  local immediate, deferred = Ext._Internal.TakeImmediateCreated()
   local events = Ext._Internal.TakeComponentEvents()
   for _, e in ipairs(events) do
     local entity = Ext._Internal.EntityValue(e[1])
-    if entity ~= nil then
+    if entity ~= nil and not (e[3] == "create" and immediate[tostring(e[1]) .. "/" .. e[2]]) then
       local component = e[3] == "create" and entity[e[2]] or nil
       Ext._Internal.FireEntityEvent(e[3], e[2], entity, component)
       Ext._Internal.FireEntityEvent(e[3] .. "-deferred", e[2], entity,
                                     e[3] == "create" and entity[e[2]] or nil)
     end
+  end
+  for _, d in ipairs(deferred) do
+    local component = d[1]:IsAlive() and d[1][d[2]] or nil
+    if component ~= nil then Ext._Internal.FireEntityEvent("create-deferred", d[2], d[1], component) end
   end
 
   -- And the replication changes the last update made: upstream's OnChange
@@ -16034,57 +17490,56 @@ end
 Ext._Internal.SubscribeEntity = subscribe
 
 function Ext.Entity.Subscribe(component, handler, entity, flags)
-  return subscribe("change", component, handler, entity, false, flags)
+  return subscribe("change", component, handler, entity, false, flags, 1, "Subscribe")
 end
 
 function Ext.Entity.OnCreate(component, handler, entity, deferred, once)
   return subscribe(deferred and "create-deferred" or "create", component,
-                   handler, entity, once == true)
+                   handler, entity, once == true, nil, 1, "OnCreate")
 end
 
 function Ext.Entity.OnCreateOnce(component, handler, entity)
-  return subscribe("create", component, handler, entity, true)
+  return subscribe("create", component, handler, entity, true, nil, 1, "OnCreateOnce")
 end
 
 function Ext.Entity.OnCreateDeferred(component, handler, entity)
-  return subscribe("create-deferred", component, handler, entity, false)
+  return subscribe("create-deferred", component, handler, entity, false, nil, 1, "OnCreateDeferred")
 end
 
 function Ext.Entity.OnCreateDeferredOnce(component, handler, entity)
-  return subscribe("create-deferred", component, handler, entity, true)
+  return subscribe("create-deferred", component, handler, entity, true, nil, 1, "OnCreateDeferredOnce")
 end
 
 function Ext.Entity.OnDestroy(component, handler, entity, deferred, once)
   return subscribe(deferred and "destroy-deferred" or "destroy", component,
-                   handler, entity, once == true)
+                   handler, entity, once == true, nil, 1, "OnDestroy")
 end
 
 function Ext.Entity.OnDestroyOnce(component, handler, entity)
-  return subscribe("destroy", component, handler, entity, true)
+  return subscribe("destroy", component, handler, entity, true, nil, 1, "OnDestroyOnce")
 end
 
 function Ext.Entity.OnDestroyDeferred(component, handler, entity)
-  return subscribe("destroy-deferred", component, handler, entity, false)
+  return subscribe("destroy-deferred", component, handler, entity, false, nil, 1, "OnDestroyDeferred")
 end
 
 function Ext.Entity.OnDestroyDeferredOnce(component, handler, entity)
-  return subscribe("destroy-deferred", component, handler, entity, true)
+  return subscribe("destroy-deferred", component, handler, entity, true, nil, 1, "OnDestroyDeferredOnce")
 end
 
 function Ext.Entity.OnChange(component, handler, entity, flags)
-  return subscribe("change", component, handler, entity, false, flags)
+  return subscribe("change", component, handler, entity, false, flags, 1, "OnChange")
 end
 
 -- Upstream's system hooks: the handler runs before or after the system's
 -- own update, on the thread the engine updates it on.
 local system_subs = { [false] = {}, [true] = {} }
 
-local function subscribe_system(system, handler, post, once)
-  if type(handler) ~= "function" then
-    error("Ext.Entity subscriptions expect a handler function", 3)
-  end
-  local index, err = Ext._Internal.HookSystem(tostring(system))
-  if index == nil then error(err, 3) end
+local function subscribe_system(system, handler, post, once, fname)
+  system = Ext._Internal.EnumArg("ExtSystemType", system, 1, 3)
+  Ext._Internal.CheckHandler(handler, fname)
+  local index, err = Ext._Internal.HookSystem(system)
+  if index == nil then Ext._Internal.RaiseOutside(err) end
   local id = next_sub
   next_sub = next_sub + 1
   local list = system_subs[post][index] or {}
@@ -16119,11 +17574,11 @@ function Ext._Internal.FireSystemUpdate(index, post)
 end
 
 function Ext.Entity.OnSystemUpdate(system, handler, once)
-  return subscribe_system(system, handler, false, once)
+  return subscribe_system(system, handler, false, once, "OnSystemUpdate")
 end
 
 function Ext.Entity.OnSystemPostUpdate(system, handler, once)
-  return subscribe_system(system, handler, true, once)
+  return subscribe_system(system, handler, true, once, "OnSystemPostUpdate")
 end
 
 function Ext.Entity.Unsubscribe(id)
@@ -16177,9 +17632,7 @@ function Ext.Entity.GetAllEntities()
 end
 
 function Ext.Entity.GetAllEntitiesWithComponent(component)
-  if type(component) ~= "string" then
-    error("Ext.Entity.GetAllEntitiesWithComponent expects a component name", 2)
-  end
+  component = Ext._Internal.EnumArg("ExtComponentType", component, 1, 2)
   local handles, err = Ext._Internal.AllEntities(component)
   if handles == nil then error("bg3le: " .. tostring(err), 2) end
   return entities_from(handles)
@@ -16302,22 +17755,25 @@ end
 
 -- Upstream's bank writes; src/vendor/static_data_write.cpp.
 function Ext.StaticData.Create(resourceType, guid)
-  if guid == nil then guid = Ext.Utils.GenerateGuid() end
-  local addr, err = Ext._Internal.StaticDataCreate(tostring(resourceType), tostring(guid))
+  resourceType = Ext._Internal.EnumArg("ExtResourceManagerType", resourceType, 1, 2)
+  if guid == nil then guid = Ext.Utils.GenerateGuid() else Ext._Internal.CheckGuid(guid, 2, 2) end
+  local addr, err = Ext._Internal.StaticDataCreate(resourceType, tostring(guid))
   if addr == nil then
     Ext.Log.PrintError(err)
     return nil
   end
-  return Ext._Internal.ReadObject(addr, tostring(resourceType), "", {})
+  return Ext._Internal.ReadObject(addr, resourceType, "", {})
 end
 
 function Ext.StaticData.ClearResourceBank(resourceType)
-  local ok, err = Ext._Internal.StaticDataBankCall(tostring(resourceType), true)
+  resourceType = Ext._Internal.EnumArg("ExtResourceManagerType", resourceType, 1, 2)
+  local ok, err = Ext._Internal.StaticDataBankCall(resourceType, true)
   if not ok then Ext.Log.PrintError(err) end
 end
 
 function Ext.StaticData.SyncResourceBank(resourceType)
-  local ok, err = Ext._Internal.StaticDataBankCall(tostring(resourceType), false)
+  resourceType = Ext._Internal.EnumArg("ExtResourceManagerType", resourceType, 1, 2)
+  local ok, err = Ext._Internal.StaticDataBankCall(resourceType, false)
   if not ok then Ext.Log.PrintError(err) end
 end
 
@@ -16328,13 +17784,13 @@ function Ext.StaticData.GetTextureAtlasManager()
 end
 
 function Ext.StaticData.GetIconAtlas(icon)
-  if type(icon) ~= "string" then return nil end
+  icon = Ext._Internal.CheckString(icon, 1, 2)
   local at = Ext._Internal.IconAtlas(icon)
   return at and Ext._Internal.ReadObject(at, "TextureAtlas", "", {}) or nil
 end
 
 function Ext.StaticData.GetIconUVs(icon)
-  if type(icon) ~= "string" then return nil end
+  icon = Ext._Internal.CheckString(icon, 1, 2)
   local at = Ext._Internal.IconUVs(icon)
   return at and Ext._Internal.ReadObject(at, "UVValues", "", {}) or nil
 end
@@ -16342,12 +17798,15 @@ end
 -- Upstream's reads of a bank's ResourceGuidsByMod: each mod and the
 -- resources it defines.
 function Ext.StaticData.GetSources(resourceType)
-  return Ext._Internal.ResourceSources(tostring(resourceType))
+  resourceType = Ext._Internal.EnumArg("ExtResourceManagerType", resourceType, 1, 2)
+  return Ext._Internal.ResourceSources(resourceType)
 end
 
 function Ext.StaticData.GetByModId(resourceType, modGuid)
-  local sources = Ext._Internal.ResourceSources(tostring(resourceType))
-  return sources and sources[string.lower(tostring(modGuid))] or nil
+  resourceType = Ext._Internal.EnumArg("ExtResourceManagerType", resourceType, 1, 2)
+  Ext._Internal.CheckGuid(modGuid, 2, 2)
+  local sources = Ext._Internal.ResourceSources(resourceType)
+  return sources and sources[string.lower(modGuid)] or nil
 end
 
 -- Upstream's Ext.Definition is Ext.StaticData under another name. It was
@@ -16360,32 +17819,21 @@ Ext.Definition = Ext.StaticData
 -- The other resource system: banks keyed by ResourceBankType, holding
 -- visuals, animations and effects rather than GUID resources. Read from the
 -- engine's current ResourceBank, as upstream's GetResource; src/resources.cpp.
-local function resource_bank_type(bankType)
-  local label = type(bankType) == "number" and Ext.Enums.ResourceBankType[bankType]
-                or bankType
-  if type(label) ~= "string" then return nil end
-  for i = 0, 33 do
-    if Ext.Enums.ResourceBankType[i] == label then return i, label end
-  end
-  return nil
+local function resource_bank_type(bankType, index)
+  local label = Ext._Internal.EnumArg("ResourceBankType", bankType, index, 3)
+  return Ext.Enums.ResourceBankType[label].Value, label
 end
 
 function Ext.Resource.Get(id, bankType)
-  local index, label = resource_bank_type(bankType)
-  if index == nil then
-    error("Ext.Resource.Get: unknown ResourceBankType " .. tostring(bankType), 2)
-  end
-  if type(id) ~= "string" then return nil end
+  id = Ext._Internal.CheckString(id, 1, 2)
+  local index, label = resource_bank_type(bankType, 2)
   local addr = Ext._Internal.ResourceBankGet(index, id)
   if addr == nil then return nil end
   return Ext._Internal.ReadObject(addr, "resource::" .. label .. "Resource", "", {})
 end
 
 function Ext.Resource.GetAll(bankType)
-  local index = resource_bank_type(bankType)
-  if index == nil then
-    error("Ext.Resource.GetAll: unknown ResourceBankType " .. tostring(bankType), 2)
-  end
+  local index = resource_bank_type(bankType, 1)
   local ids = Ext._Internal.ResourceBankKeys(index)
   if ids == nil then error("Resource manager not available", 2) end
   return ids
@@ -16849,17 +18297,10 @@ if not Ext._Internal.IsClientState() then
   end
 
   function Ext.Level.CreateSurfaceAction(actionType)
-    local value = actionType
-    if type(actionType) == "string" then
-      value = nil
-      for k, label in pairs(Ext.Enums.SurfaceActionType) do
-        if type(k) == "number" and label == actionType then value = k end
-      end
-    end
-    value = math.tointeger(value)
-    if value == nil or SURFACE_ACTION_CLASS[value] == nil then
-      error("bg3le: " .. tostring(actionType) .. " is not a SurfaceActionType", 2)
-    end
+    local label = Ext._Internal.EnumArg("SurfaceActionType", actionType, 1, 2)
+    local value = Ext.Enums.SurfaceActionType[label].Value
+    -- Only None has no class; the engine makes nothing for it.
+    if SURFACE_ACTION_CLASS[value] == nil then return nil end
     local at, why = Ext._Internal.SurfaceActionCreate(value)
     if at == nil then
       if why ~= nil then error("bg3le: Ext.Level.CreateSurfaceAction: " .. why, 2) end
@@ -17557,6 +18998,97 @@ void lua_bind_osi(const std::vector<osi::Function>& functions) {
     lua_run(R"LUA(
 setmetatable(_G, nil)  -- Osiris is bound; typos are plain nils again
 
+-- Upstream's OsiFunctionName (Lua/Osiris/FunctionProxy.inl): one object per
+-- name, called by argument count, with Get, Delete, Exists, Type,
+-- InputArities and Arities. FunctionType numbers to OsiFunctionType labels.
+local FUNCTION_TYPE = {[1] = "Event", [2] = "Query", [3] = "Call", [4] = "DB",
+                       [5] = "Proc", [6] = "Query", [7] = "Call", [8] = "Query"}
+local objects = {}
+local function osi_object(name, impl)
+  if objects[name] ~= nil then return objects[name] end
+  local sigs
+  -- Kept once known; an empty answer may only mean the story is not bound yet.
+  local function signatures()
+    if sigs ~= nil then return sigs end
+    local found = Ext._Internal.OsiSignatures(name) or {}
+    if #found > 0 then sigs = found end
+    return found
+  end
+  local function by_inputs(n)
+    for _, s in ipairs(signatures()) do
+      if s.InputArity == n then return s end
+    end
+    return nil
+  end
+  local function arities(field)
+    local out, seen = {}, {}
+    for _, s in ipairs(signatures()) do
+      if not seen[s[field]] then seen[s[field]] = true; out[#out + 1] = s[field] end
+    end
+    table.sort(out)
+    return out
+  end
+  local function db_method(method)
+    return function(_, ...)
+      local n = select("#", ...)
+      local s = by_inputs(n)
+      if s == nil then error(string.format("No database named '%s(%d)' exists", name, n), 2) end
+      if s.Type ~= 4 or type(impl) ~= "table" then
+        error(string.format("'%s(%d)' is not a database", name, n), 2)
+      end
+      -- A column of the wrong type raises as upstream's MatchTuple does from
+      -- its C method: named for it, counted past self when called with ':'.
+      local colon = debug.getinfo(1, "n").namewhat == "method"
+      local results = table.pack(pcall(impl[method], impl, ...))
+      if not results[1] then
+        local err = results[2]
+        if type(err) == "string" then
+          err = err:gsub("bad argument #(%d+) to '[^']*'", function(k)
+            return "bad argument #" .. (tonumber(k) - (colon and 1 or 0)) .. " to '" .. method .. "'"
+          end, 1)
+        end
+        Ext._Internal.Reraise(err)
+      end
+      return table.unpack(results, 2, results.n)
+    end
+  end
+  local methods = {
+    Get = db_method("Get"),
+    Delete = db_method("Delete"),
+    Exists = function(_, arity) return by_inputs(arity) ~= nil end,
+    Type = function(_, arity)
+      local s = by_inputs(arity)
+      if s == nil then return nil end
+      return Ext.Enums.OsiFunctionType[FUNCTION_TYPE[s.Type] or "Call"]
+    end,
+  }
+  local meta
+  meta = {
+    __name = "OsiFunctionName",
+    __call = function(_, ...) return impl(...) end,
+    __index = function(_, key)
+      local m = methods[key]
+      if m ~= nil then return m end
+      if key == "InputArities" then return arities("InputArity") end
+      if key == "Arities" then return arities("Arity") end
+      error("Not a valid OsiFunction method or property: " .. tostring(key), 2)
+    end,
+    __tostring = function() return "OsiFunction(" .. name .. ")" end,
+    __eq = function(a, b)
+      return Ext._Internal.RawGetMetatable(a) == meta and Ext._Internal.RawGetMetatable(b) == meta
+    end,
+  }
+  local obj = Ext._Internal.NewObjectProxy(meta)
+  objects[name] = obj
+  return obj
+end
+
+for name, impl in pairs(Osi) do
+  local obj = osi_object(name, impl)
+  rawset(Osi, name, obj)
+  if rawget(_G, name) == impl then rawset(_G, name, obj) end
+end
+
 local lower = {}
 for name in pairs(Osi) do lower[string.lower(name)] = name end
 setmetatable(Osi, {
@@ -17573,8 +19105,9 @@ setmetatable(Osi, {
 
     -- The story's own procedures, events and databases, which are not
     -- bound up front: the first mention of one resolves it.
-    local story = Ext._Internal.StoryFunction(key)
-    if story ~= nil then
+    local impl, real = Ext._Internal.StoryFunction(key)
+    if impl ~= nil then
+      local story = osi_object(real or key, impl)
       rawset(t, key, story)
       lower[string.lower(key)] = key
       _G[key] = story  -- bare calls work too, as they do upstream

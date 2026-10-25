@@ -382,22 +382,19 @@ ImmediateWorldCache::ComponentChanges* ImmediateWorldCache::Changes::GetOrAddCom
     return components;
 }
 
-ImmediateWorldCache::ComponentChanges* ImmediateWorldCache::GetOrAddComponentChanges(ComponentTypeIndex type)
-{
-    auto typeIdx = (uint16_t)type;
-    auto typeInfo = EntityWorld->ComponentRegistry_.Get(type);
-    return WriteChanges.GetOrAddComponentChanges(typeInfo, Allocator);
-}
-
 bool ImmediateWorldCache::RemoveComponent(EntityHandle entity, ComponentTypeIndex type)
 {
     auto typeInfo = EntityWorld->ComponentRegistry_.Get(type);
+    if (!typeInfo) {
+        return false;
+    }
+
     auto component = EntityWorld->GetCommittedComponent(entity, type, typeInfo->InlineSize);
     if (!component) {
         return false;
     }
 
-    auto changes = GetOrAddComponentChanges(type);
+    auto changes = WriteChanges.GetOrAddComponentChanges(typeInfo, Allocator);
     auto change = changes->Components.find(entity);
 
     if (!change) {
@@ -421,11 +418,11 @@ bool ImmediateWorldCache::RemoveComponent(EntityHandle entity, ComponentTypeInde
 bool ImmediateWorldCache::PrepareAddComponent(EntityHandle entity, ComponentTypeIndex type, void*& component)
 {
     auto typeInfo = EntityWorld->ComponentRegistry_.Get(type);
-    if (EntityWorld->GetCommittedComponent(entity, type, typeInfo->InlineSize)) {
+    if (!typeInfo || EntityWorld->GetCommittedComponent(entity, type, typeInfo->InlineSize)) {
         return false;
     }
 
-    auto changes = GetOrAddComponentChanges(type);
+    auto changes = WriteChanges.GetOrAddComponentChanges(typeInfo, Allocator);
     auto change = changes->Components.find(entity);
 
     if (!change) {
@@ -880,7 +877,8 @@ void* EntitySystemHelpersBase::CreateComponentRaw(EntityHandle entity, ExtCompon
     }
 
     ComponentFrameStorageIndex index;
-    auto ptr = GetEntityWorld()->Deferred()->CreateComponentRaw(entity, *meta.ComponentIndex, meta.InlineSize, index, (void*)meta.Properties->ProxyDestroy);
+    auto dtor = meta.IsProxy ? (void*)meta.Properties->ProxyDestroy : (void*)meta.Properties->Destroy;
+    auto ptr = GetEntityWorld()->Deferred()->CreateComponentRaw(entity, *meta.ComponentIndex, meta.InlineSize, index, dtor);
 
     if (meta.IsProxy) {
         auto external = GameAllocRaw(meta.ExternalSize);
@@ -915,16 +913,16 @@ void* EntitySystemHelpersBase::CreateComponentImmediateRaw(EntityHandle entity, 
             *comp = GameAllocRaw(meta.ExternalSize);
             memset(*comp, 0, meta.ExternalSize);
             meta.Properties->Construct(*comp);
+            iwc->FinalizeAddComponent(entity, *meta.ComponentIndex, ptr);
             return *comp;
         } else {
             // Ensure we're using zeroed memory since not every component has proper default constructors
             // and could end up using leftover garbage from memory
             memset(ptr, 0, meta.InlineSize);
             meta.Properties->Construct(ptr);
+            iwc->FinalizeAddComponent(entity, *meta.ComponentIndex, ptr);
             return ptr;
         }
-
-        iwc->FinalizeAddComponent(entity, *meta.ComponentIndex, ptr);
     }
 
     return nullptr;
@@ -938,7 +936,15 @@ bool EntitySystemHelpersBase::RemoveComponent(EntityHandle entity, ExtComponentT
         return false;
     }
 
-    GetEntityWorld()->Deferred()->RemoveComponent(entity, *meta.ComponentIndex, meta.InlineSize, (void*)meta.Properties->ProxyDestroy);
+    // Need to check for component existence before appending to the ECB;
+    // deleting from a not yet committed (i.e. still in ECB) entity or a nonexistent component via the ECB will crash
+    auto storage = GetEntityWorld()->GetEntityStorage(entity);
+    if (!storage || storage->ComponentTypeToIndex.find(*meta.ComponentIndex) == storage->ComponentTypeToIndex.end()) {
+        return false;
+    }
+
+    auto dtor = meta.IsProxy ? (void*)meta.Properties->ProxyDestroy : (void*)meta.Properties->Destroy;
+    GetEntityWorld()->Deferred()->RemoveComponent(entity, *meta.ComponentIndex, meta.InlineSize, dtor);
     return true;
 }
 
@@ -1138,6 +1144,28 @@ void EntitySystemHelpersBase::UpdateComponentMappings()
     initialized_ = true;
 }
 
+void EntitySystemHelpersBase::UnmapMissingComponents()
+{
+    // Remove components that have a valid ID but are not registered in the current EntityWorld
+    // (i.e. server-only components on the client and vice versa).
+    // This ensures we won't try to access null ComponentRegistry or ComponentOps entries.
+    for (uint32_t i = 0; i < (uint32_t)ExtComponentType::Max; i++) {
+        auto& desc = extComponentMap_[i];
+        if (desc.ComponentIndex
+            && World->ComponentRegistry_.Get(*desc.ComponentIndex) == nullptr) {
+            
+            ecsComponentData_.GetOrAdd(*desc.ComponentIndex).ExtType = {};
+            BindExtComponent(*desc.ComponentIndex, {});
+            desc.ComponentIndex = {};
+
+            if (desc.ReplicationIndex) {
+                ecsComponentData_.GetOrAdd(*desc.ReplicationIndex).ExtType = {};
+                desc.ReplicationIndex = {};
+            }
+        }
+    }
+}
+
 void EntitySystemHelpersBase::ValidatePropertyMapBindings()
 {
     for (uint32_t componentType = 0; componentType < extComponentMap_.size(); componentType++) {
@@ -1148,14 +1176,14 @@ void EntitySystemHelpersBase::ValidatePropertyMapBindings()
     }
 }
 
-void EntitySystemHelpersBase::BindExtComponent(ComponentTypeIndex componentIndex, ExtComponentType type)
+void EntitySystemHelpersBase::BindExtComponent(ComponentTypeIndex componentIndex, std::optional<ExtComponentType> type)
 {
     auto idx = (uint32_t)SparseHashMapHash(componentIndex);
     if (idx >= componentMap_.size()) {
         componentMap_.resize(idx + 1);
     }
 
-    componentMap_[idx] = &extComponentMap_[(unsigned)type];
+    componentMap_[idx] = type ? &extComponentMap_[(unsigned)*type] : nullptr;
 }
 
 void EntitySystemHelpersBase::MapComponentIndices(char const* componentName, ExtComponentType type, std::size_t size, bool isProxy, bool oneFrame)
@@ -1379,6 +1407,10 @@ void EntitySystemHelpersBase::Bind()
     // The underlying EntityWorld pointer should never change after binding
     se_assert(world == nullptr || World == nullptr || world == World);
     World = world;
+
+    if (World != nullptr) {
+        UnmapMissingComponents();
+    }
 }
 
 void EntitySystemHelpersBase::PreUpdate()
@@ -1844,6 +1876,10 @@ EntityHandle EntitySystemHelpersBase::GetEntityHandle(Guid const& uuid)
 
 resource::GuidResourceBankBase* EntitySystemHelpersBase::GetRawResourceManager(ExtResourceManagerType type)
 {
+    if (type >= ExtResourceManagerType::Max) {
+        return {};
+    }
+
     auto index = staticDataIndices_[(unsigned)type];
     if (index == resource::UndefinedStaticDataType || (unsigned)type >= std::size(staticDataIndices_)) {
         OsiError("No resource manager index mapping registered for " << type);

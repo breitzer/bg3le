@@ -324,6 +324,43 @@ bool array_resize_thunk(void* container, std::size_t count) {
     return true;
 }
 
+// A fresh container of the given length, the field's elements relocated into
+// it bitwise with the one at skip left out (or none), its header copied over
+// the field's. Nothing is destroyed: the old buffer, and an erased element,
+// are left where they are.
+template <class A>
+bool array_relocate(void* container, std::size_t count, std::size_t skip) {
+    if (!bg3le_game_allocator_ready() || count > (1u << 20)) return false;
+    auto* old = static_cast<A*>(container);
+    const std::size_t n = (std::size_t)old->size();
+    using E = std::remove_cv_t<std::remove_pointer_t<decltype(old->data())>>;
+    alignas(A) unsigned char raw[sizeof(A)];
+    auto* fresh = new (raw) A();
+    fresh->resize((typename A::size_type)count);
+    auto* to = reinterpret_cast<unsigned char*>(const_cast<E*>(fresh->data()));
+    auto const* from = reinterpret_cast<unsigned char const*>(old->data());
+    std::size_t at = 0;
+    for (std::size_t i = 0; i < n && at < count; ++i) {
+        if (i == skip) continue;
+        std::memcpy(to + at * sizeof(E), from + i * sizeof(E), sizeof(E));
+        ++at;
+    }
+    std::memcpy(container, raw, sizeof(A));
+    return true;
+}
+
+template <class A>
+bool array_erase_thunk(void* container, std::size_t index) {
+    const std::size_t n = (std::size_t)static_cast<A*>(container)->size();
+    return index < n && array_relocate<A>(container, n - 1, index);
+}
+
+template <class A>
+bool array_append_thunk(void* container) {
+    const std::size_t n = (std::size_t)static_cast<A*>(container)->size();
+    return array_relocate<A>(container, n + 1, (std::size_t)-1);
+}
+
 template <class A>
 bool legacy_array_resize_thunk(void* container, std::size_t count) {
     using E = typename LegacyArrayTraits<A>::Elem;
@@ -1105,6 +1142,8 @@ constexpr FieldKind kind_of() {
         return FieldKind::Text;
     } else if constexpr (std::is_same_v<T, Version>) {
         return FieldKind::Version;
+    } else if constexpr (std::is_same_v<T, gn::GenomeVariant>) {
+        return FieldKind::GenomeVariant;
     } else if constexpr (std::is_same_v<T, EntityOrVec3Variant>) {
         return FieldKind::EntityOrVec3;
     } else if constexpr (BitArrayTraits<T>::kIs) {
@@ -1311,6 +1350,8 @@ constexpr FieldDesc make_plain_field(char const* name, std::size_t offset) {
         if constexpr (std::is_default_constructible_v<E>
                       && std::is_move_constructible_v<E>) {
             f.Resize = &array_resize_thunk<T>;
+            f.Erase = &array_erase_thunk<T>;
+            f.Append = &array_append_thunk<T>;
         }
     } else if constexpr (CompactSetTraits<T>::kIsCompactSet) {
         using E = typename CompactSetTraits<T>::Elem;
@@ -1384,9 +1425,6 @@ constexpr FieldDesc make_plain_field(char const* name, std::size_t offset) {
         }
     } else if constexpr (TextTraits<T>::kIsText) {
         f.ReadText = &TextTraits<T>::read;
-        f.ReadOnly = true;
-    } else if constexpr (std::is_same_v<T, Version>
-                         || std::is_same_v<T, EntityOrVec3Variant>) {
         f.ReadOnly = true;
     } else if constexpr (std::is_same_v<T, StatsExpressionRef>) {
         // A StatsExpressionRef is its StatsExpressionPooled*, and upstream
@@ -1531,11 +1569,18 @@ struct ClassFields {
     // Upstream's Construct and ProxyDestroy for a component (GetProxyDestructor).
     void (*Construct)(void*);
     void (*ProxyDestroy)(void**);
+    // And its Destroy (GetDestructor), which the ECB gets for an inline component since v33.
+    void (*Destroy)(void*);
 };
 
 template <class T>
 void construct_thunk(void* at) {
     new (at) T();
+}
+
+template <class T>
+void destroy_thunk(void* at) {
+    static_cast<T*>(at)->~T();
 }
 
 template <class T>
@@ -1806,6 +1851,13 @@ inline constexpr ClassFields kClassFields{
             return &proxy_destroy_thunk<T>;
         } else {
             return (void (*)(void**))nullptr;
+        }
+    }(),
+    [] {
+        if constexpr (std::is_default_constructible_v<T> && !std::is_trivially_destructible_v<T>) {
+            return &destroy_thunk<T>;
+        } else {
+            return (void (*)(void*))nullptr;
         }
     }(),
 };
@@ -2275,6 +2327,10 @@ extern "C" std::size_t bg3le_meta_class_size(void const* handle) {
 
 extern "C" void* bg3le_meta_proxy_destroy(void const* handle) {
     return handle != nullptr ? (void*)static_cast<ClassFields const*>(handle)->ProxyDestroy : nullptr;
+}
+
+extern "C" void* bg3le_meta_destroy(void const* handle) {
+    return handle != nullptr ? (void*)static_cast<ClassFields const*>(handle)->Destroy : nullptr;
 }
 
 extern "C" bool bg3le_meta_class_constructible(void const* handle) {
@@ -2817,6 +2873,17 @@ extern "C" bool bg3le_meta_map_key_label(void const* handle, char const* path,
         }
     }
     return false;
+}
+
+// The Lua name of an enum-typed map key's enum, for pushing the key as an
+// EnumValue as upstream's map proxy does; null for any other key.
+extern "C" char const* bg3le_meta_map_key_enum(void const* handle, char const* path) {
+    if (handle == nullptr || path == nullptr) return nullptr;
+    const auto r = resolve_path(static_cast<ClassFields const*>(handle), path, nullptr);
+    if (!r.Ok || r.Field.Kind != FieldKind::Map || r.Field.KeyTypeName == nullptr) return nullptr;
+    auto it = by_enum_name().find(std::string_view(r.Field.KeyTypeName, r.Field.KeyTypeNameLength));
+    if (it == by_enum_name().end() || it->second->IsBitmask) return nullptr;
+    return it->second->LuaName != nullptr ? it->second->LuaName : it->second->Name;
 }
 
 // A Text field's text. *present is false for one that reads as nil -- a null
@@ -3547,6 +3614,7 @@ extern "C" char const* bg3le_meta_kind_name(std::uint8_t kind) {
         case FieldKind::Version: return "version";
         case FieldKind::EntityOrVec3: return "entityorvec3";
         case FieldKind::BitArray: return "bitarray";
+        case FieldKind::GenomeVariant: return "genomevariant";
         default: return "unsupported";
     }
 }
@@ -3685,3 +3753,49 @@ extern "C" char const* bg3le_meta_short_name(void const* handle) {
 }
 
 }  // namespace bg3le
+
+// gn::GenomeVariant {Value, Type}: the type's name (a FixedString index, ~0u when
+// untyped), the value's size, and where the value is -- in Value itself when it
+// fits, else where Value points, as GenomeVariant::GetValue reads it.
+extern "C" bool bg3le_genome_variant(void const* variant, std::uint32_t* typeName,
+                                     std::uint64_t* size, void** value) {
+    *typeName = 0xffffffffu;
+    *size = 0;
+    *value = nullptr;
+    void* raw[2] = {};
+    if (variant == nullptr || !bg3le::safe_read(variant, raw, sizeof(raw))) return false;
+    if (raw[1] == nullptr) return true;
+    auto const* type = static_cast<char const*>(raw[1]);
+    if (!bg3le::safe_read(type + offsetof(bg3se::gn::GenomeVarTypeDesc, TypeName), typeName, sizeof(*typeName))
+        || !bg3le::safe_read(type + offsetof(bg3se::gn::GenomeVarTypeDesc, Size), size, sizeof(*size))) {
+        return false;
+    }
+    *value = *size <= sizeof(void*) ? const_cast<void*>(variant) : raw[0];
+    return *value != nullptr;
+}
+
+// A TGenomeSet's elements: its TrackedCompactSet's buffer and count, laid out the
+// same for every element type.
+extern "C" bool bg3le_genome_set(void const* set, void** data, std::uint32_t* count) {
+    *data = nullptr;
+    *count = 0;
+    if (set == nullptr) return false;
+    auto const* values = static_cast<bg3se::gn::TGenomeSet<float> const*>(set)->Values;
+    if (values == nullptr) return true;
+    *data = const_cast<float*>(values->data());
+    *count = (std::uint32_t)values->size();
+    return true;
+}
+
+// Upstream's erase and push_back on a DynArray field: false when it has no
+// thunk for them (a set, a queue) or the index is out of range.
+extern "C" bool bg3le_meta_array_erase(void const* handle, char const* path, void* base,
+                                       std::size_t index, bool append) {
+    if (handle == nullptr || path == nullptr || base == nullptr) return false;
+    const auto r = bg3le::resolve_path(static_cast<bg3le::ClassFields const*>(handle), path, base);
+    if (!r.Ok || r.Address == nullptr || r.Field.Kind != bg3le::FieldKind::DynArray || r.Field.ReadOnly) {
+        return false;
+    }
+    if (append) return r.Field.Append != nullptr && r.Field.Append(r.Address);
+    return r.Field.Erase != nullptr && r.Field.Erase(r.Address, index);
+}

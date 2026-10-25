@@ -110,6 +110,15 @@ void TimerManager::RegisterPersistentCallback(FixedString const& name, Ref callb
     persistentCallbacks_.set(name, LuaDelegate<void(RegistryEntry, TimerHandle)>(state_.GetState(), callback));
 }
 
+TimerManager::BaseTimer* TimerManager::Find(TimerHandle handle)
+{
+    if (handle & PersistentFlag) {
+        return persistentTimers_.Find((uint32_t)handle);
+    } else {
+        return ephemeralTimers_.Find((uint32_t)handle);
+    }
+}
+
 bool TimerManager::Cancel(TimerHandle handle)
 {
     if (handle & PersistentFlag) {
@@ -121,12 +130,7 @@ bool TimerManager::Cancel(TimerHandle handle)
 
 bool TimerManager::Pause(TimerHandle handle)
 {
-    BaseTimer* timer{ nullptr };
-    if (handle & PersistentFlag) {
-        timer = persistentTimers_.Find((uint32_t)handle);
-    } else {
-        timer = ephemeralTimers_.Find((uint32_t)handle);
-    }
+    auto timer = Find(handle);
 
     if (timer) {
         if (!timer->Paused) {
@@ -140,12 +144,7 @@ bool TimerManager::Pause(TimerHandle handle)
 
 bool TimerManager::Resume(TimerHandle handle)
 {
-    BaseTimer* timer{ nullptr };
-    if (handle & PersistentFlag) {
-        timer = persistentTimers_.Find((uint32_t)handle);
-    } else {
-        timer = ephemeralTimers_.Find((uint32_t)handle);
-    }
+    auto timer = Find(handle);
 
     if (timer) {
         if (timer->Paused) {
@@ -160,13 +159,7 @@ bool TimerManager::Resume(TimerHandle handle)
 
 bool TimerManager::IsPaused(TimerHandle handle)
 {
-    BaseTimer* timer{ nullptr };
-    if (handle & PersistentFlag) {
-        timer = persistentTimers_.Find((uint32_t)handle);
-    } else {
-        timer = ephemeralTimers_.Find((uint32_t)handle);
-    }
-
+    auto timer = Find(handle);
     return timer && timer->Paused;
 }
 
@@ -186,6 +179,14 @@ void TimerManager::Update(double time)
 
         FireTimer(entry);
     }
+
+    for (auto handle : pendingRepeat_) {
+        auto timer = Find(handle);
+        if (timer) {
+            QueueTimer(*timer);
+        }
+    }
+    pendingRepeat_.clear();
 }
 
 void TimerManager::FireTimer(TimerQueueEntry const& entry)
@@ -221,8 +222,14 @@ void TimerManager::FireTimer(TimerQueueEntry const& entry)
 void TimerManager::RepeatOrReleaseTimer(BaseTimer& timer)
 {
     if (timer.Repeat > 0.0f) {
-        timer.Time = lastUpdate_ + timer.Repeat;
-        QueueTimer(timer);
+        timer.Time += timer.Repeat;
+        // We try to avoid timer drift if possible; if the timer fell significantly behind
+        // (i.e. lag or repeat time < frame time), compensate by adjusting
+        // to the current game time.
+        if (timer.Time < lastUpdate_ - (2.0f * timer.Repeat)) {
+            timer.Time = lastUpdate_;
+        }
+        pendingRepeat_.push_back(timer.Handle);
     } else {
         if (timer.Handle & PersistentFlag) {
             persistentTimers_.Free((uint32_t)timer.Handle);
@@ -346,6 +353,14 @@ TimerHandle WaitFor(lua_State* L, float delay, Ref callback, std::optional<float
 {
     auto state = State::FromLua(L);
 
+    if (isnan(delay) || delay < .0f) {
+        delay = .0f;
+    }
+
+    if (repeat && (isnan(*repeat) || *repeat < .0f)) {
+        *repeat = .0f;
+    }
+
     return state->GetTimers().GameTimer().Add(delay / 1000.0f, callback, repeat ? (*repeat / 1000.0f) : 0.0f);
 }
 
@@ -357,6 +372,14 @@ TimerHandle WaitForPersistent(lua_State* L, float delay, FixedString callback, R
         luaL_error(L, "Persistent timers are only supported on the server");
     }
 
+    if (isnan(delay) || delay < .0f) {
+        delay = .0f;
+    }
+
+    if (repeat && (isnan(*repeat) || *repeat < .0f)) {
+        *repeat = .0f;
+    }
+
     json::StringifyContext ctx;
     ctx.Beautify = false;
     auto str = json::Stringify(L, ctx, args.Index());
@@ -366,6 +389,14 @@ TimerHandle WaitForPersistent(lua_State* L, float delay, FixedString callback, R
 TimerHandle WaitForRealtime(lua_State* L, float delay, Ref callback, std::optional<float> repeat)
 {
     auto state = State::FromLua(L);
+
+    if (isnan(delay) || delay < .0f) {
+        delay = .0f;
+    }
+
+    if (repeat && (isnan(*repeat) || *repeat < .0f)) {
+        *repeat = .0f;
+    }
 
     return state->GetTimers().RealtimeTimer().Add(delay / 1000.0f, callback, repeat ? (*repeat / 1000.0f) : 0.0f);
 }

@@ -59,6 +59,7 @@ Client IMGUI SetScale
 Client IMGUI SetUIScaleMultiplier
 Both IO AddPathOverride
 Both IO AppendFile
+Both IO FindFiles
 Both IO GetPathOverride
 Both IO LoadFile
 Both IO SaveFile
@@ -290,6 +291,7 @@ Both Types Serialize
 Both Types TypeOf
 Both Types Unserialize
 Both Types Validate
+Client UI Defer
 Client UI EnableErrorReporting
 Client UI GetCursorControl
 Client UI GetDragDrop

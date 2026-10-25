@@ -41,8 +41,12 @@
 #include <GameDefinitions/Stats/Stats.h>
 #include <GameDefinitions/Components/All.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <map>
+#include <mutex>
+#include <unordered_set>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -2039,10 +2043,18 @@ extern "C" char const* bg3le_stats_attr_label(void const* object,
     // RPGEnumeration is Name then Values, so the map follows the name.
     auto const* map = (bg3se::LegacyMap<bg3se::FixedString, std::int32_t> const*)
         ((char const*)en + state().ValueNameOffset + 8);
+    // Upstream's label cache: the last label for a value, within the capped range.
+    std::int32_t maxValue = 0;
+    std::size_t entries = 0;
+    char const* found = nullptr;
     for (auto const& pair : *map) {
-        if (pair.Value == raw) return text_of(pair.Key);
+        maxValue = std::max(maxValue, pair.Value);
+        ++entries;
+        if (pair.Value == raw) found = text_of(pair.Key);
     }
-    return nullptr;
+    maxValue = std::min(maxValue, (std::int32_t)entries * 10);
+    if (raw < 0 || raw > maxValue) return nullptr;
+    return found;
 }
 
 // A flag set's labels, joined by semicolons.
@@ -2079,12 +2091,34 @@ extern "C" bool bg3le_stats_attr_flags(void const* object, std::size_t index,
     auto const* map = (bg3se::LegacyMap<bg3se::FixedString, std::int32_t> const*)
         ((char const*)en + f.ValueNameOffset + 8);
 
-    std::size_t used = 0;
+    // Upstream's StatEnumerationCache since v33: labels by value, the range
+    // capped at ten per entry, out-of-range entries ignored; GetFlags then
+    // reads them in bit order.
+    std::int32_t maxValue = 0;
+    std::size_t entries = 0;
     for (auto const& pair : *map) {
+        maxValue = std::max(maxValue, pair.Value);
+        ++entries;
+    }
+    maxValue = std::min(maxValue, (std::int32_t)entries * 10);
+    std::map<std::int32_t, char const*> labels;  // the last label for a value wins
+    // Both contexts read flags, from their own threads.
+    static std::mutex warnedLock;
+    static std::unordered_set<void const*> warned;
+    for (auto const& pair : *map) {
+        if (pair.Value >= 0 && pair.Value <= maxValue) {
+            labels[pair.Value] = text_of(pair.Key);
+        } else if (const std::lock_guard<std::mutex> held(warnedLock); warned.insert(en).second) {
+            logf("stats: label '%s' (%d) in an enumeration is out of range and will be ignored",
+                 text_of(pair.Key) != nullptr ? text_of(pair.Key) : "?", pair.Value);
+        }
+    }
+
+    std::size_t used = 0;
+    for (auto const& [value, label] : labels) {
         // Value zero is an entry like "None = 0" and never belongs in a set.
-        if (pair.Value == 0) continue;
-        if ((mask & (1ull << (pair.Value - 1))) == 0) continue;
-        char const* label = text_of(pair.Key);
+        if (value <= 0 || value > 64) continue;
+        if ((mask & (1ull << (value - 1))) == 0) continue;
         if (label == nullptr) continue;
 
         const std::size_t len = std::strlen(label);

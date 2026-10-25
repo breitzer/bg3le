@@ -198,6 +198,7 @@ list(APPEND VENDOR_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/stat_sync.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/stat_create.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/stats_sets.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/table_find.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/audio.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/moveable.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/cache_template.cpp

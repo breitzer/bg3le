@@ -705,6 +705,7 @@ sources = [
     'GameDefinitions/Stats/Entries.h',
     'GameDefinitions/Physics.h',
     'GameDefinitions/Picking.h',
+    'GameDefinitions/RenderFramework.h',
     'GameDefinitions/Render.h',
     'GameDefinitions/Resources.h',
     'GameDefinitions/Skeleton.h',
@@ -728,6 +729,12 @@ sources = [
 
 def get_most_recent_change():
     mtime = 0
+    
+    for file in os.listdir('GameDefinitions/PropertyMaps'):
+        if file.endswith('.inl'):
+            fmtime = os.path.getmtime('GameDefinitions/PropertyMaps/' + file)
+            mtime = fmtime if fmtime > mtime else mtime
+
     for source in sources:
         fmtime = os.path.getmtime(source)
         mtime = fmtime if fmtime > mtime else mtime

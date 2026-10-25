@@ -6,11 +6,26 @@ StatStructureCache gStatStructureCache;
 
 void StatEnumerationCache::Build(RPGEnumeration const& enumeration)
 {
-	Labels.resize(enumeration.Values.size());
+	if (enumeration.Values.size() == 0) {
+		return;
+	}
+
+	int32_t maxValue = 0;
 	for (auto const& kv : enumeration.Values) {
-		se_assert(kv.Value >= 0 && kv.Value < (int32_t)Labels.size());
-		Labels[kv.Value] = kv.Key;
-		LabelToIndex.set(kv.Key, kv.Value);
+		maxValue = std::max(maxValue, kv.Value);
+	}
+
+	// Cap value list size in case the enum contains irrationally large values
+	maxValue = std::min(maxValue, (int32_t)enumeration.Values.size() * 10);
+	Labels.resize(maxValue + 1);
+
+	for (auto const& kv : enumeration.Values) {
+		if (kv.Value >= 0 && kv.Value <= maxValue) {
+			Labels[kv.Value] = kv.Key;
+			LabelToIndex.set(kv.Key, kv.Value);
+		} else {
+			WARN("Label '%s' (%d) in enumeration '%s' is out of range and will be ignored", kv.Key.GetString(), kv.Value, enumeration.Name.GetString());
+		}
 	}
 }
 
@@ -84,6 +99,13 @@ StatModifierCache const* StatStructureCache::GetCachedAttribute(uint32_t modifie
 	return modifierList->NameToModifier.get_or_default(attribute);
 }
 
+std::optional<int32_t> StatStructureCache::GetCachedCondition(STDString const& condition)
+{
+	RebuildIfNecessary();
+	auto idx = liveData_->ConditionToIndex.try_get(condition);
+	return idx ? *idx : std::optional<int32_t>{};
+}
+
 void StatStructureCache::Invalidate()
 {
 	invalidated_ = true;
@@ -119,6 +141,10 @@ void StatStructureCache::Rebuild()
 
 	for (uint32_t i = 0; i < stats->ModifierLists.Values.size(); i++) {
 		CacheModifierList(i, *stats->ModifierLists.Values[i]);
+	}
+
+	for (uint32_t i = 0; i < stats->Conditions.size(); i++) {
+		buildData_->ConditionToIndex.set(stats->Conditions[i], i);
 	}
 
 	previousData_.reset();

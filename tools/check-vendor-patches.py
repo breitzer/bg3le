@@ -32,6 +32,8 @@ CHECKS = [
              and "field_F0_bg3le" in text("BG3Extender/GameDefinitions/UI.h")),
     ("custom property WriteCallback goes through bg3le's UI queue",
      lambda: "bg3le_ui_property_written(ptr, this->GetName().Str())" in text("BG3Extender/Lua/Libs/ClientUI/CustomProperties.inl")),
+    ("a wrapped DataContext property registers its base with bg3le",
+     lambda: "bg3le_ui_wrapped_property(this, baseProperty);" in text("BG3Extender/Lua/Libs/ClientUI/CustomProperties.inl")),
     ("ModifierList::Name in the manager's tail padding",
      lambda: "[[no_unique_address]] CNamedElementManager<Modifier> Attributes;" in text("BG3Extender/GameDefinitions/Stats/Stats.h")),
     ("entity handle generator grows by one page",

@@ -36,6 +36,7 @@
     X(_ZN6Noesis13SymbolManager9GetStringEj) \
     X(_ZN6Noesis14BaseCollection12AddComponentEPNS_13BaseComponentE) \
     X(_ZN6Noesis14BaseCollection12SetComponentEjPNS_13BaseComponentE) \
+    X(_ZN6Noesis14BaseCollection8RemoveAtEj) \
     X(_ZN6Noesis16TypeClassBuilder11AddPropertyEPNS_12TypePropertyE) \
     X(_ZN6Noesis16TypeClassBuilder12AddInterfaceEPKNS_9TypeClassEj) \
     X(_ZN6Noesis16TypeClassBuilder7AddBaseEPKNS_9TypeClassE) \

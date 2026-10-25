@@ -11,6 +11,7 @@
 // DeferredUIEvents and UIEventHooks, which need upstream's Lua state. Both are
 // by Norbyte and the bg3se contributors (https://github.com/Norbyte/bg3se).
 
+#include <atomic>
 #include <deque>
 #include <utility>
 #include <mutex>
@@ -22,6 +23,7 @@
 #include "../log.h"
 #include "../hook.h"
 #include "../mem.h"
+#include "../noesis_ui.h"
 #include <NsGui/BaseCollection.h>
 
 extern "C" bool bg3le_with_client_lua(void (*fn)(lua_State*, void*), void* user);
@@ -53,6 +55,17 @@ BaseObject* object_arg(lua_State* L, int index)
 BaseObject* optional_object(lua_State* L, int index)
 {
     return lua_isnoneornil(L, index) ? nullptr : object_arg(L, index);
+}
+
+// A property value that has to be an object, as upstream's get<BaseObject*>:
+// a plain value or nil raises (lua_get_lightcppany).
+BaseObject* value_object(lua_State* L, int index)
+{
+    if (!lua_islightuserdata(L, index)) {
+        luaL_error(L, "Param %d: expected a light C++ object, got %s", index, luaL_typename(L, index));
+        return nullptr;
+    }
+    return object_arg(L, index);
 }
 
 void push_object(lua_State* L, void const* o)
@@ -338,8 +351,30 @@ bool getter_missing(TypeProperty const* prop, int slot)
     return false;
 }
 
+// TypePropertyDataContextWrapped -> the property it wraps.
+std::mutex g_wrapped_lock;
+std::unordered_map<TypeProperty const*, TypeProperty const*> g_wrapped;
+
+TypeProperty const* wrapped_base(TypeProperty const* prop)
+{
+    std::lock_guard<std::mutex> held(g_wrapped_lock);
+    auto it = g_wrapped.find(prop);
+    return it != g_wrapped.end() ? it->second : nullptr;
+}
+
 void push_property(lua_State* L, BaseObject const* obj, TypeProperty const* prop)
 {
+    // Read as the base property on the wrapped object, so an engine base gets
+    // the slot order and missing-getter checks below.
+    if (auto base = wrapped_base(prop)) {
+        obj = static_cast<NsCustomDataContext const*>(obj)->GetWrappedContext();
+        if (obj == nullptr) {
+            lua_pushnil(L);
+            return;
+        }
+        prop = base;
+    }
+
     auto& types = gStaticSymbols.Types;
     auto& classes = gStaticSymbols.TypeClasses;
     auto type = prop->GetContentType();
@@ -454,61 +489,7 @@ std::optional<StoredValueHolder> floats_value(lua_State* L, int index, int n)
 
 extern "C" void* bg3le_noesis_symbol(char const* mangled);
 
-// A value boxed as the game boxes it: built in place, given the game's own
-// Boxed<T> vtable, and refused unless the game's GetValuePtr finds the value.
-template <class T>
-BaseComponent* box_as(T const& value, char const* vtable, char const* getValuePtr)
-{
-    static auto* vt = static_cast<char*>(bg3le_noesis_symbol(vtable));
-    static auto get = reinterpret_cast<void const* (*)(void const*)>(bg3le_noesis_symbol(getValuePtr));
-    if (vt == nullptr || get == nullptr) return nullptr;
-    auto* boxed = new Boxed<T>(value);
-    void* game = vt + 16;  // past offset-to-top and typeinfo
-    std::memcpy((void*)boxed, &game, sizeof(game));
-    if (get(boxed) != &boxed->mValue) {
-        ERR("Ext.UI: the game's %s does not match bg3le's layout; not boxing", vtable);
-        return nullptr;
-    }
-    return boxed;
-}
-
-// A string, number or boolean for a property that holds an object, as Noesis
-// boxes XAML's Tag="text"; push_stored already unboxes it on the way back.
-BaseComponent* box_lua(lua_State* L, int index)
-{
-    switch (lua_type(L, index)) {
-    case LUA_TSTRING:
-        return box_as<String>(String(lua_tostring(L, index)),
-                              "_ZTVN6Noesis5BoxedINS_11FixedStringILj24EEEEE",
-                              "_ZNK6Noesis5BoxedINS_11FixedStringILj24EEEE11GetValuePtrEv");
-    case LUA_TBOOLEAN:
-        return box_as<bool>(lua_toboolean(L, index) != 0, "_ZTVN6Noesis5BoxedIbEE",
-                            "_ZNK6Noesis5BoxedIbE11GetValuePtrEv");
-    case LUA_TNUMBER:
-        if (lua_isinteger(L, index)) {
-            const lua_Integer v = lua_tointeger(L, index);
-            if (v >= INT32_MIN && v <= INT32_MAX) {
-                return box_as<int32_t>((int32_t)v, "_ZTVN6Noesis5BoxedIiEE",
-                                       "_ZNK6Noesis5BoxedIiE11GetValuePtrEv");
-            }
-        }
-        return box_as<double>(lua_tonumber(L, index), "_ZTVN6Noesis5BoxedIdEE",
-                              "_ZNK6Noesis5BoxedIdE11GetValuePtrEv");
-    default:
-        return nullptr;
-    }
-}
-
-bool plain_value(lua_State* L, int index)
-{
-    const int lt = lua_type(L, index);
-    return lt == LUA_TSTRING || lt == LUA_TNUMBER || lt == LUA_TBOOLEAN;
-}
-
-// owned: a box made for a raw-object property, whose creation reference the
-// caller drops once the property holds it.
-std::optional<StoredValueHolder> get_value(lua_State* L, Type const* type, int index,
-                                           BaseComponent** owned = nullptr)
+std::optional<StoredValueHolder> get_value(lua_State* L, Type const* type, int index)
 {
     auto& classes = gStaticSymbols.TypeClasses;
     auto& types = gStaticSymbols.Types;
@@ -523,7 +504,10 @@ std::optional<StoredValueHolder> get_value(lua_State* L, Type const* type, int i
     if (type == types.UInt64.Type) return hold((uint64_t)luaL_checkinteger(L, index));
     if (type == types.Single.Type) return hold((float)luaL_checknumber(L, index));
     if (type == types.Double.Type) return hold((double)luaL_checknumber(L, index));
-    if (type == types.Bool.Type) return hold(lua_toboolean(L, index) != 0);
+    if (type == types.Bool.Type) {
+        luaL_checktype(L, index, LUA_TBOOLEAN);
+        return hold(lua_toboolean(L, index) != 0);
+    }
     if (type == types.Symbol.Type) return hold(Symbol(luaL_checkstring(L, index)));
     if (type == types.Color.Type || type == types.Rect.Type || type == types.Thickness.Type
         || type == types.CornerRadius.Type) {
@@ -548,40 +532,20 @@ std::optional<StoredValueHolder> get_value(lua_State* L, Type const* type, int i
         auto label = luaL_checkstring(L, index);
         auto value = TypeHelpers::StringToEnum(static_cast<TypeEnum const*>(type), label);
         if (!value) {
-            luaL_error(L, "Invalid enum value '%s' for enumeration '%s'", label, type->GetName());
+            // Logged and the write dropped, as upstream's.
+            ERR("Invalid enum value '%s' for enumeration '%s'", label, type->GetName());
             return {};
         }
         return hold(*value);
     }
     if (TypeHelpers::IsDescendantOf(type, classes.BaseObject.Type)) {
-        // A plain value where any object goes (FrameworkElement.Tag) is boxed.
-        if (plain_value(L, index)
-            && TypeHelpers::IsDescendantOf(classes.BoxedValue.Type, static_cast<TypeClass const*>(type))) {
-            auto boxed = box_lua(L, index);
-            if (boxed == nullptr) {
-                luaL_error(L, "Cannot box a %s for '%s'", luaL_typename(L, index), type->GetName());
-                return {};
-            }
-            if (owned != nullptr) *owned = boxed;
-            return StoredValueHolder(static_cast<BaseObject*>(boxed));
-        }
-        return StoredValueHolder(optional_object(L, index));
+        return StoredValueHolder(value_object(L, index));
     }
 
     auto typeOfType = type->GetClassType();
     if (typeOfType == types.TypePtr.Type) {
         auto content = static_cast<TypePtr const*>(type)->GetStaticContentType();
-        // A plain value where any object goes (FrameworkElement.Tag) is boxed.
-        if (plain_value(L, index)
-            && TypeHelpers::IsDescendantOf(classes.BoxedValue.Type, static_cast<TypeClass const*>(content))) {
-            auto boxed = box_lua(L, index);
-            if (boxed == nullptr) {
-                luaL_error(L, "Cannot box a %s for '%s'", luaL_typename(L, index), type->GetName());
-                return {};
-            }
-            return StoredValueHolder(static_cast<BaseObject*>(boxed));
-        }
-        auto obj = static_cast<BaseComponent*>(object_arg(L, index));
+        auto obj = static_cast<BaseComponent*>(value_object(L, index));
         if (!TypeHelpers::IsDescendantOf(obj->GetClassType(), static_cast<TypeClass const*>(content))) {
             luaL_error(L, "Expected object of type '%s', got '%s'", type->GetName(), obj->GetClassType()->GetName());
             return {};
@@ -631,10 +595,11 @@ std::unordered_map<std::string, uint32_t> g_write_handlers;
 // Keeps the last delivered one alive until Lua has had it.
 Fired g_delivered;
 
+// No reference to the element, as upstream's since patch 8 ("don't set
+// reference to avoid dtor crash"): the handler stays on it, inactive once gone.
 struct Subscription
 {
     uint32_t Id{ 0 };
-    UIElement* Target{ nullptr };
     RoutedEvent const* Event{ nullptr };
     std::string Name;
     bool Active{ false };
@@ -714,7 +679,7 @@ bool take(lua_State* L, std::deque<Fired>& queue)
 
 int l_root(lua_State* L)
 {
-    push_object(L, nsui::GetRoot());
+    push_object(L, nsui::GetRoot(L));
     return 1;
 }
 
@@ -823,6 +788,161 @@ int l_collection_count(lua_State* L)
     return 1;
 }
 
+// UiCollectionSet(collection, i, item) -> written, as upstream's array proxy
+// writes a Noesis collection: item i replaced, removed by nil, or appended at Count + 1.
+int l_collection_set(lua_State* L)
+{
+    ensure_symbols();
+    auto obj = optional_object(L, 1);
+    const lua_Integer index = luaL_checkinteger(L, 2);
+    for (auto t = obj != nullptr ? obj->GetClassType() : nullptr; t != nullptr; t = t->GetBase()) {
+        if (std::strcmp(t->GetName(), "BaseCollection") != 0) continue;
+        auto items = static_cast<BaseCollection*>(static_cast<BaseComponent*>(obj));
+        const lua_Integer count = items->Count();
+        // As upstream's SetElement: get<BaseComponent*>, a plain value raising.
+        auto item = lua_isnil(L, 3) ? nullptr : static_cast<BaseComponent*>(value_object(L, 3));
+        if (index >= 1 && index <= count) {
+            if (item == nullptr) {
+                items->RemoveAt((uint32_t)(index - 1));
+            } else {
+                items->SetComponent((uint32_t)(index - 1), item);
+            }
+        } else if (index == count + 1) {
+            if (item != nullptr) items->AddComponent(item);
+        } else {
+            lua_pushboolean(L, 0);
+            return 1;
+        }
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+    return luaL_error(L, "%s is not a collection", obj != nullptr ? obj->GetClassType()->GetName() : "nil");
+}
+
+void push_type_ref(lua_State* L, Type const* type)
+{
+    lua_createtable(L, 0, 1);
+    lua_pushstring(L, type != nullptr ? type->GetName() : "");
+    lua_setfield(L, -2, "Name");
+}
+
+// The class descriptor upstream's TypeInfo() returns, with its Base chain.
+void push_type_info(lua_State* L, TypeClass const* type)
+{
+    // Each Base level holds its table and the one being filled.
+    luaL_checkstack(L, 8, "UI type chain too deep");
+    auto& cls = gClassCache.GetClass(type);
+    lua_createtable(L, 0, 6);
+    lua_pushstring(L, type->GetName());
+    lua_setfield(L, -2, "Name");
+    lua_pushboolean(L, type->IsInterface());
+    lua_setfield(L, -2, "IsInterface");
+
+    lua_newtable(L);
+    int i = 0;
+    for (auto prop : cls.Properties) {
+        lua_createtable(L, 0, 3);
+        lua_pushstring(L, prop->GetName().Str());
+        lua_setfield(L, -2, "Name");
+        push_type_ref(L, prop->GetContentType());
+        lua_setfield(L, -2, "ContentType");
+        lua_pushboolean(L, prop->IsReadOnly());
+        lua_setfield(L, -2, "IsReadOnly");
+        lua_rawseti(L, -2, ++i);
+    }
+    lua_setfield(L, -2, "Properties");
+
+    lua_newtable(L);
+    i = 0;
+    for (auto dp : cls.DependencyProperties) {
+        lua_createtable(L, 0, 4);
+        lua_pushstring(L, dp->GetName().Str());
+        lua_setfield(L, -2, "Name");
+        push_type_ref(L, dp->GetType());
+        lua_setfield(L, -2, "ValueType");
+        push_type_ref(L, dp->GetOwnerType());
+        lua_setfield(L, -2, "OwnerType");
+        lua_pushboolean(L, dp->IsReadOnly());
+        lua_setfield(L, -2, "IsReadOnly");
+        lua_rawseti(L, -2, ++i);
+    }
+    lua_setfield(L, -2, "DependencyProperties");
+
+    lua_newtable(L);
+    i = 0;
+    for (auto event : cls.Events) {
+        lua_createtable(L, 0, 2);
+        lua_pushstring(L, event->GetName().Str());
+        lua_setfield(L, -2, "Name");
+        push_type_ref(L, event->GetOwnerType());
+        lua_setfield(L, -2, "OwnerType");
+        lua_rawseti(L, -2, ++i);
+    }
+    lua_setfield(L, -2, "RoutedEvents");
+
+    if (auto base = type->GetBase()) {
+        push_type_info(L, base);
+        lua_setfield(L, -2, "Base");
+    }
+}
+
+int l_type_info(lua_State* L)
+{
+    ensure_symbols();
+    push_type_info(L, object_arg(L, 1)->GetClassType());
+    return 1;
+}
+
+}  // namespace Noesis::bg3le_ui
+extern "C" bool bg3le_meta_format_guid(void const* bytes, char* out, std::size_t capacity);
+namespace Noesis::bg3le_ui {
+
+// UiWidgetField(o, name) -> found, value: the ui::UIWidget fields upstream maps.
+// Offsets are this build's, read off live widgets (FileName at +0x328 in each).
+int l_widget_field(lua_State* L)
+{
+    ensure_symbols();
+    auto o = object_arg(L, 1);
+    char const* name = luaL_checkstring(L, 2);
+    struct Field { char const* Name; std::size_t Offset; char Kind; };
+    static const Field kFields[] = {
+        {"WidgetData", 0x2f8, 'o'}, {"StateId", 0x308, 'g'}, {"LayerIndex", 0x320, 'i'},
+        {"IndexInLayer", 0x324, 'i'}, {"FileName", 0x328, 's'}, {"Flags", 0x388, 'b'},
+        {"Flags2", 0x389, 'b'}, {"Flags3", 0x38a, 'b'}, {"PlayerId", 0x38c, 'h'},
+    };
+    Field const* field = nullptr;
+    for (auto const& f : kFields) {
+        if (std::strcmp(f.Name, name) == 0) field = &f;
+    }
+    bool widget = false;
+    for (auto t = field != nullptr ? o->GetClassType() : nullptr; t != nullptr && !widget; t = t->GetBase()) {
+        widget = std::strcmp(t->GetName(), "ls.UIWidget") == 0;
+    }
+    if (!widget) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    auto at = reinterpret_cast<char const*>(o) + field->Offset;
+    lua_pushboolean(L, 1);
+    switch (field->Kind) {
+    case 'o': push_object(L, *reinterpret_cast<void* const*>(at)); break;
+    case 'g': {
+        char text[40];
+        if (bg3le_meta_format_guid(at, text, sizeof(text))) lua_pushstring(L, text); else lua_pushnil(L);
+        break;
+    }
+    case 'i': lua_pushinteger(L, *reinterpret_cast<int32_t const*>(at)); break;
+    case 's': {
+        auto s = reinterpret_cast<bg3se::STDString const*>(at);
+        lua_pushlstring(L, s->data(), s->size());
+        break;
+    }
+    case 'b': lua_pushinteger(L, *reinterpret_cast<uint8_t const*>(at)); break;
+    default: lua_pushinteger(L, *reinterpret_cast<int16_t const*>(at)); break;
+    }
+    return 2;
+}
+
 int l_visual_parent(lua_State* L)
 {
     ensure_symbols();
@@ -909,23 +1029,19 @@ int l_set(lua_State* L)
             return luaL_error(L, "Property %s of %s is read-only", prop->Property->GetName().Str(),
                               o->GetClassType()->GetName());
         }
-        BaseComponent* owned = nullptr;
-        auto val = get_value(L, prop->Property->GetContentType(), 3, &owned);
+        auto val = get_value(L, prop->Property->GetContentType(), 3);
         if (val) prop->Property->Set(o, val->IsIntegral ? &val->Value : val->Value);
-        if (owned != nullptr) owned->Release();
         lua_pushboolean(L, 1);
         return 1;
     }
     if (prop != nullptr && prop->DepProperty != nullptr) {
         auto dp = prop->DepProperty;
-        BaseComponent* owned = nullptr;
-        auto val = get_value(L, dp->GetType(), 3, &owned);
+        auto val = get_value(L, dp->GetType(), 3);
         if (val) {
             dp->GetValueManager()->SetValue(static_cast<DependencyObject*>(o), dp,
                 val->IsIntegral ? &val->Value : val->Value, 0, nullptr, nullptr,
                 Value::Destination_BaseValue);
         }
-        if (owned != nullptr) owned->Release();
         lua_pushboolean(L, 1);
         return 1;
     }
@@ -1101,7 +1217,7 @@ int l_subscribe(lua_State* L)
     std::size_t index;
     {
         std::lock_guard<std::mutex> held(g_lock);
-        g_subscriptions.push_back(Subscription{ id, target, event, name, true });
+        g_subscriptions.push_back(Subscription{ id, event, name, true });
         index = g_subscriptions.size();
     }
     target->AddHandler(event, relay_for(index));
@@ -1112,20 +1228,13 @@ int l_subscribe(lua_State* L)
 int l_unsubscribe(lua_State* L)
 {
     auto index = (std::size_t)luaL_checkinteger(L, 1);
-    Subscription sub;
-    {
-        std::lock_guard<std::mutex> held(g_lock);
-        if (index == 0 || index > g_subscriptions.size() || !g_subscriptions[index - 1].Active) {
-            lua_pushboolean(L, 0);
-            return 1;
-        }
-        g_subscriptions[index - 1].Active = false;
-        sub = g_subscriptions[index - 1];
+    // As upstream's Unsubscribe: deactivated, the element left alone.
+    std::lock_guard<std::mutex> held(g_lock);
+    if (index == 0 || index > g_subscriptions.size() || !g_subscriptions[index - 1].Active) {
+        lua_pushboolean(L, 0);
+        return 1;
     }
-    void* vtable = nullptr;
-    if (bg3le::safe_read(sub.Target, &vtable, sizeof(vtable)) && vtable != nullptr) {
-        sub.Target->RemoveHandler(sub.Event, relay_for(index));
-    }
+    g_subscriptions[index - 1].Active = false;
     lua_pushboolean(L, 1);
     return 1;
 }
@@ -1172,7 +1281,56 @@ int l_take_event(lua_State* L)
     return 4;
 }
 
+// Ext.UI.Defer's queue is the prelude's; this only flags that it has work, so
+// the UI thread takes the client lock only then.
+std::atomic<bool> g_deferred{ false };
+
+int l_defer_pending(lua_State* L)
+{
+    g_deferred.store(true);
+    return 0;
+}
+
+// UiNewProxy(metatable): a full userdata, so type() says "userdata" as upstream's does.
+int l_new_proxy(lua_State* L)
+{
+    luaL_checktype(L, 1, LUA_TTABLE);
+    lua_newuserdata(L, 0);
+    lua_pushvalue(L, 1);
+    lua_setmetatable(L, -2);
+    return 1;
+}
+
+// UiThreadPump() -> whether the UI thread runs the deferred callbacks.
+int l_thread_pump(lua_State* L)
+{
+    lua_pushboolean(L, ::bg3le::noesis_update_hooked());
+    return 1;
+}
+
+void call_deferred(lua_State* L, void*)
+{
+    const int top = lua_gettop(L);
+    lua_getglobal(L, "Ext");
+    lua_getfield(L, -1, "_Internal");
+    lua_getfield(L, -1, "UiRunDeferred");
+    if (lua_isfunction(L, -1) && lua_pcall(L, 0, 0, 0) != LUA_OK) {
+        ERR("Error while running deferred UI callbacks: %s", lua_tostring(L, -1));
+    }
+    lua_settop(L, top);
+}
+
 }  // namespace Noesis::bg3le_ui
+
+// The UI thread, before each View::Update: upstream runs Ext.UI.Defer's
+// callbacks there, at ui::DeferredPredicatesManager::UpdateFromUI.
+extern "C" void bg3le_ui_run_deferred()
+{
+    if (!Noesis::bg3le_ui::g_deferred.exchange(false)) return;
+    if (!bg3le_with_client_lua(&Noesis::bg3le_ui::call_deferred, nullptr)) {
+        Noesis::bg3le_ui::g_deferred.store(true);
+    }
+}
 
 namespace {
 std::string write_key(void const* object, char const* name)
@@ -1197,6 +1355,12 @@ void Noesis::bg3le_ui_property_written(void* object, char const* name)
     Noesis::bg3le_ui::g_writes.push_back(Noesis::bg3le_ui::Fired{
         it->second, Noesis::Ptr<Noesis::BaseComponent>(static_cast<Noesis::BaseComponent*>(object)),
         {}, name });
+}
+
+void Noesis::bg3le_ui_wrapped_property(TypeProperty const* wrapper, TypeProperty const* base)
+{
+    std::lock_guard<std::mutex> held(Noesis::bg3le_ui::g_wrapped_lock);
+    Noesis::bg3le_ui::g_wrapped[wrapper] = base;
 }
 
 bool bg3le_ui_command_bound(void const* command)
@@ -1241,6 +1405,9 @@ extern "C" void bg3le_ui_register(lua_State* L)
         {"UiVisualChild", Noesis::bg3le_ui::l_visual_child},
         {"UiCollectionItem", Noesis::bg3le_ui::l_collection_item},
         {"UiCollectionCount", Noesis::bg3le_ui::l_collection_count},
+        {"UiCollectionSet", Noesis::bg3le_ui::l_collection_set},
+        {"UiTypeInfo", Noesis::bg3le_ui::l_type_info},
+        {"UiWidgetField", Noesis::bg3le_ui::l_widget_field},
         {"UiVisualParent", Noesis::bg3le_ui::l_visual_parent},
         {"UiChildCount", Noesis::bg3le_ui::l_child_count},
         {"UiChild", Noesis::bg3le_ui::l_child},
@@ -1261,6 +1428,9 @@ extern "C" void bg3le_ui_register(lua_State* L)
         {"UiTakeEvent", Noesis::bg3le_ui::l_take_event},
         {"UiRaiseEvent", Noesis::bg3le_ui::l_raise_event},
         {"UiTakeWrite", Noesis::bg3le_ui::l_take_write},
+        {"UiDeferPending", Noesis::bg3le_ui::l_defer_pending},
+        {"UiNewProxy", Noesis::bg3le_ui::l_new_proxy},
+        {"UiThreadPump", Noesis::bg3le_ui::l_thread_pump},
         {nullptr, nullptr}};
     luaL_setfuncs(L, functions, 0);
 }

@@ -36,6 +36,7 @@ namespace bg3le { void install_entity_trace_hook(); }
 #include "savegame.h"
 #include "debug_server.h"
 #include "lua_host.h"
+#include "version.h"
 #include "osi.h"
 #include "fast_alloc.h"
 
@@ -105,9 +106,8 @@ extern "C" std::size_t bg3le_mods_count();
 extern "C" void bg3le_mods_rescan();
 extern "C" char const* bg3le_game_version();
 
-// The Script Extender API version bg3le implements, and the game build its
-// data layouts were established against -- see reference/version.txt.
-constexpr int kExtenderApiVersion = 32;
+// The game build bg3le's data layouts were established against -- see
+// reference/version.txt. The API version is in version.h.
 constexpr char const* kValidatedGameVersion = "v4.73.98.727";
 extern "C" void bg3le_pak_modules_prewarm();
 extern "C" bool bg3le_stat_origins_ready();
@@ -747,6 +747,16 @@ long call_wrapper(long a, long b, long c, long d, long e, long f) {
     return listening_call(a, b, c, d, e, f);
 }
 
+// Engine queries too: upstream's QueryWrapper fires the same hooks since v33.
+long listening_query(long a, long b, long c, long d, long e, long f) {
+    const auto id = static_cast<std::uint32_t>(a);
+    const bool watched = osi::call_watched(id);
+    if (watched) osi::fire_call(id, reinterpret_cast<const void*>(b), "before");
+    const long rc = g_real_query != nullptr ? g_real_query(a, b, c, d, e, f) : 0;
+    if (watched) osi::fire_call(id, reinterpret_cast<const void*>(b), "after");
+    return rc;
+}
+
 long query_wrapper(long a, long b, long c, long d, long e, long f) {
     static unsigned long seen = 0;
     if (++seen <= 10) logf("DIV Query arg0=0x%lx arg1=0x%lx", a, b);
@@ -757,7 +767,7 @@ long query_wrapper(long a, long b, long c, long d, long e, long f) {
         std::call_once(once, [a, b] {
             test_requery((unsigned)a, reinterpret_cast<void*>(b));
         });
-    return g_real_query != nullptr ? g_real_query(a, b, c, d, e, f) : 0;
+    return listening_query(a, b, c, d, e, f);
 }
 
 // Returns the table to pass on: either our patched copy or the original.
@@ -773,10 +783,11 @@ void* maybe_wrap_div_table(void* init_fn) {
     g_real_query = reinterpret_cast<Thunk6>(copy[2]);
 
     // osi::invoke() bypasses the DIV table, so it goes through the
-    // listening wrapper directly; the story reaches it through the table.
+    // listening wrappers directly; the story reaches them through the table.
     osi::set_handlers(reinterpret_cast<void*>(&listening_call),
-                      reinterpret_cast<void*>(g_real_query));
+                      reinterpret_cast<void*>(&listening_query));
     copy[1] = reinterpret_cast<std::uintptr_t>(&listening_call);
+    copy[2] = reinterpret_cast<std::uintptr_t>(&listening_query);
 
     const char* opt = std::getenv("BG3LE_WRAP_DIV");
     if (opt == nullptr || opt[0] != '1') {

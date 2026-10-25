@@ -99,6 +99,9 @@ private:
 // bg3le: write callbacks go through bg3le's own UI queue, not upstream's Lua state.
 bool bg3le_ui_property_watched(void const* object, char const* name);
 void bg3le_ui_property_written(void* object, char const* name);
+// bg3le: a wrapped property is read through its base, whose engine accessors are
+// not in the headers' slot order.
+void bg3le_ui_wrapped_property(TypeProperty const* wrapper, TypeProperty const* base);
 #endif
 
 // TypeProperty with INotifyPropertyChanged and Lua write callback support
@@ -201,7 +204,11 @@ public:
     TypePropertyDataContextWrapped(Symbol name, TypeProperty const* baseProperty)
         : TypeProperty(name, baseProperty->GetContentType()),
         baseProperty_(baseProperty)
-    {}
+    {
+#if defined(BG3LE_NOESIS_FORWARD)
+        bg3le_ui_wrapped_property(this, baseProperty);
+#endif
+    }
 
     static BaseComponent* GetWrapped(const void* ptr)
     {

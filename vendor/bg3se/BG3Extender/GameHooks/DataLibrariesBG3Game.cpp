@@ -131,6 +131,7 @@ namespace bg3se
         SYM_OFF(ls__ThreadRegistry__RequestThreadIndex);
         SYM_OFF(ls__FileReader__ctor);
         SYM_OFF(ls__FileReader__dtor);
+        SYM_OFF(ls__FileSystem__CollectFilesWithGlob);
         SYM_OFF(ls__PathRoots);
         SYM_OFF(App__Ctor);
         SYM_OFF(App__UpdatePaths);
@@ -224,6 +225,7 @@ namespace bg3se
         SYM_OFF(Noesis__VisualTreeHelper__HitTest);
 
         SYM_OFF(ui__DataContextProvider__ExecuteCommandQueues);
+        SYM_OFF(ui__deferred__PredicatesManager__UpdateFromUI);
 
         SYM_OFF(AppInstance);
 

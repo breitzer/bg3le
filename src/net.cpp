@@ -30,6 +30,7 @@
 #include <string>
 
 #include "debug_server.h"
+#include "game_state.h"
 #include "hook.h"
 #include "lauxlib.h"
 #include "log.h"
@@ -1004,13 +1005,20 @@ int l_net_info(lua_State* L) {
             || (gameClient != nullptr && read_at(gameClient, kClientHostPeer, &host) && host >= 0);
         lua_pushboolean(L, connected);
         lua_setfield(L, -2, "Connected");
+        // Whether this process runs a game server, ticking or not yet: upstream's
+        // GameServer being there, which a load has before the first tick.
+        char const* serverState = forced ? nullptr : server_game_state();
+        const bool serverRunning = serverState != nullptr
+            && std::strcmp(serverState, "Uninitialized") != 0 && std::strcmp(serverState, "Unknown") != 0;
+        lua_pushboolean(L, serverRunning);
+        lua_setfield(L, -2, "ServerRunning");
         const bool extended = g_host_extended.load();
         lua_pushboolean(L, extended);
         lua_setfield(L, -2, "HostHasExtender");
         const std::uint32_t version = hosting ? kVersionCurrent
             : std::min(extended ? g_host_version.load() : kVersionInitial, kVersionCurrent);
         table_field(L, "Version", version);
-        table_field(L, "LocalUser", hosting ? net_local_user() : kReservedUser);
+        table_field(L, "LocalUser", hosting || serverRunning ? net_local_user() : kReservedUser);
         return 1;
     }
     void* server = g_server.load();

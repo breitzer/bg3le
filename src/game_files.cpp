@@ -173,4 +173,16 @@ bool game_file_exists(char const* relative) {
     return index().Files.find(relative) != index().Files.end();
 }
 
+std::vector<std::string> game_files_under(std::string const& prefix) {
+    std::vector<std::string> out;
+    const std::lock_guard<std::mutex> held(g_lock);
+    build();
+    auto const& files = index().Files;
+    for (auto it = files.lower_bound(prefix);
+         it != files.end() && it->first.compare(0, prefix.size(), prefix) == 0; ++it) {
+        out.push_back(it->first);
+    }
+    return out;
+}
+
 }  // namespace bg3le

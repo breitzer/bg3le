@@ -12,4 +12,7 @@ void noesis_set_symbols(const SymbolTable* symbols);
 void* noesis_view();
 void* noesis_root();
 
+// Whether View::Update is hooked: the UI thread then runs Ext.UI.Defer's callbacks.
+bool noesis_update_hooked();
+
 }  // namespace bg3le

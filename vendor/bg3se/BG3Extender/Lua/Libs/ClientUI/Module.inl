@@ -57,9 +57,20 @@ namespace bg3le { void* noesis_root(); }
 /// <lua_module>UI</lua_module>
 BEGIN_NS(ecl::lua::ui)
 
-Noesis::FrameworkElement* GetRoot()
+Noesis::FrameworkElement* GetRoot(lua_State* L)
 {
     Noesis::gStaticSymbols.Initialize();
+
+#if !defined(BG3LE_NOESIS_FORWARD)
+    // bg3le: its prelude warns, since it runs the deferred callbacks.
+    if (!ClientState::FromLua(L)->GetDeferredUIEvents().IsDispatchingOnRenderThread()) {
+        WARN_ONCE(
+            "Accessing Noesis state (Ext.UI.GetRoot()) from the global context carries a risk of crashing; "
+            "use Ext.UI.Defer(...) to ensure Noesis is only accessed from a deferred context."
+        );
+    }
+#endif
+
 #if defined(BG3LE_NOESIS_FORWARD)
     // bg3le: the View's content, found by vtable; no resource manager needed.
     return static_cast<Noesis::FrameworkElement*>(bg3le::noesis_root());
@@ -191,6 +202,13 @@ void EnableErrorReporting(bool enable)
     }
 }
 
+void Defer(lua_State* L, FunctionRef callback)
+{
+    ClientState::FromLua(L)->GetDeferredUIEvents().DeferNoesisThreadCallback(
+        PersistentRegistryEntry(L, callback.Index)
+    );
+}
+
 void RegisterUILib()
 {
     DECLARE_MODULE(UI, Client)
@@ -203,6 +221,7 @@ void RegisterUILib()
     MODULE_FUNCTION(GetPickingHelper)
     MODULE_FUNCTION(GetCursorControl)
     MODULE_FUNCTION(GetDragDrop)
+    MODULE_FUNCTION(Defer)
     MODULE_FUNCTION(EnableErrorReporting)
     END_MODULE()
 }

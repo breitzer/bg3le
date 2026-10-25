@@ -11,6 +11,7 @@
 #include <cstring>
 #include <link.h>
 #include <cstdlib>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -115,8 +116,9 @@ Value read(const void* node, unsigned short type) {
         case kReal: v.real = a.get_float(node); break;
         case kString:
         case kGuidString: {
+            // A null string, such as an output not yet set, is nil to Lua.
             const char* s = a.get_string(node);
-            if (s != nullptr) v.text = s;
+            if (s != nullptr) v.text = s; else v.type = kNone;
             break;
         }
         default:
@@ -528,6 +530,8 @@ std::unordered_map<std::string, DbEntry>& database() {
 // it is replaced: a second story load brought back unbound entries while
 // this stayed set, and every story procedure read as missing.
 bool g_defs_bound = false;
+// The story key the signature cache was loaded under, to rewrite a stale one.
+std::string g_cache_story;
 
 // Osiris' node list, which is what a story-defined function is actually
 // reached through: a procedure is run by inserting a tuple into its node,
@@ -1359,6 +1363,39 @@ bool is_string_type(std::uint16_t type) {
     return base == kTypeString || base == kTypeGuidString;
 }
 
+// A story type's base, as upstream's ResolveAlias gives it, or a GUID string
+// when nothing says otherwise.
+unsigned short slot_type(std::uint8_t declared) {
+    if (declared < 6) return declared;
+    const std::uint16_t base = resolve_alias(declared);
+    return base >= 1 && base <= kTypeGuidString ? base : kGuidString;
+}
+
+// A node typed with its declared story type, read by its base. The number
+// getters assert on the exact base type, so those values are read where
+// SetInteger and SetFloat put them; GetAnyString resolves the alias itself.
+Value read_declared(const void* node, std::uint8_t declared) {
+    const unsigned short base = slot_type(declared);
+    if (declared < 6 || base == kString || base == kGuidString) return read(node, base);
+    Value v;
+    v.type = base;
+    char const* at = static_cast<char const*>(node) + 8;
+    if (base == kInteger) {
+        std::int32_t i = 0;
+        std::memcpy(&i, at, sizeof(i));
+        v.integer = i;
+    } else if (base == kInteger64) {
+        std::int64_t i = 0;
+        std::memcpy(&i, at, sizeof(i));
+        v.integer = i;
+    } else if (base == kReal) {
+        float f = 0;
+        std::memcpy(&f, at, sizeof(f));
+        v.real = f;
+    }
+    return v;
+}
+
 // Learned from what the story stores, not from the engine's table.
 //
 // bg3se resolves an alias through OsiTypeDb::Aliases, an array of
@@ -1474,6 +1511,44 @@ void learn_aliases() {
          strings + guids + numbers, guids, strings, numbers, unclear);
 }
 
+// The story's own type declarations, from the header Osiris writes while it
+// loads: alias_type {NAME, id, base} and enum_type {NAME, id, ...}, an enum
+// being an integer. Covers the types no fact stores, which learning misses.
+void read_story_header_types() {
+    char const* home = std::getenv("HOME");
+    if (home == nullptr) return;
+    const std::string path = std::string(home)
+        + "/.local/share/Larian Studios/Baldur's Gate 3/Temp/Story/story_header.div";
+    std::FILE* f = std::fopen(path.c_str(), "r");
+    if (f == nullptr) return;
+
+    std::size_t aliases = 0;
+    std::size_t enums = 0;
+    char line[4096];
+    char name[256];
+    unsigned int id = 0;
+    unsigned int base = 0;
+    while (std::fgets(line, sizeof(line), f) != nullptr) {
+        if (std::sscanf(line, "alias_type {%255[^,], %u, %u}", name, &id, &base) == 3) {
+            if (id < kTypeCount && base > 0 && base < kTypeCount) {
+                g_alias[id] = (std::uint16_t)base;
+                ++aliases;
+            }
+        } else if (std::sscanf(line, "enum_type {%255[^,], %u,", name, &id) == 2) {
+            if (id < kTypeCount) {
+                g_alias[id] = kInteger;
+                ++enums;
+            }
+        } else if (std::strncmp(line, "query ", 6) == 0 || std::strncmp(line, "call ", 5) == 0) {
+            break;  // the type declarations come first
+        }
+    }
+    std::fclose(f);
+    if (aliases + enums == 0) return;
+    g_alias_ready = true;
+    logf("osiris: %zu type aliases and %zu enum types from the story header", aliases, enums);
+}
+
 // A value whose type says nothing, read by its own shape. Used for an
 // aliased type that appears in no fact anywhere, so nothing could be
 // learned about it.
@@ -1568,6 +1643,8 @@ std::uint64_t intern_string(char const* text, bool guid) {
 // the node a tuple is inserted into is reached through it -- so the tree
 // walk still has to happen, just not during the level load. The first
 // call pays the ~0.4s; a session where no mod calls Osiris never does.
+void save_cached_signatures(char const* story);
+
 bool bind_defs() {
     if (g_defs_bound) return true;
 
@@ -1618,10 +1695,24 @@ bool bind_defs() {
         it->second.Def = entry.second.Def;
         if (it->second.Types.empty()) it->second.Types = entry.second.Types;
     }
+    // The cache key (the story version) is the same for every mod set, so a
+    // cache can be another story's: what this one lacks is dropped.
+    std::size_t gone = 0;
+    for (auto it = database().begin(); it != database().end();) {
+        if (live.count(it->first) == 0) {
+            it = database().erase(it);
+            ++gone;
+        } else {
+            ++it;
+        }
+    }
 
     g_defs_bound = true;
-    logf("osiris: bound %zu function objects (%zu the cache did not have)",
-         live.size(), added);
+    logf("osiris: bound %zu function objects (%zu the cache did not have, %zu it had that the story does not)",
+         live.size(), added, gone);
+    if ((added != 0 || gone != 0) && !g_cache_story.empty()) {
+        save_cached_signatures(g_cache_story.c_str());
+    }
     return true;
 }
 
@@ -1757,8 +1848,8 @@ std::string cache_path(char const* story) {
     return std::string(home) + "/.local/share/bg3le/osiris-" + safe + ".txt";
 }
 
-// A store without this line predates out masks, and is walked again.
-constexpr char kStoreFormat[] = "# format 2\n";
+// A store without this line predates the FunctionType offset, and is walked again.
+constexpr char kStoreFormat[] = "# format 3\n";
 
 // name/arity outs outmask type,type,...
 bool load_cached_signatures(char const* story,
@@ -1782,6 +1873,12 @@ bool load_cached_signatures(char const* story,
         std::size_t story = 0;
         if (std::sscanf(line, "# story %zu", &story) == 1) {
             g_story_functions = story;
+            continue;
+        }
+
+        unsigned long typeAt = 0;
+        if (std::sscanf(line, "# typeat %lx", &typeAt) == 1) {
+            type_offset() = typeAt;
             continue;
         }
 
@@ -1852,6 +1949,7 @@ void save_cached_signatures(char const* story) {
     // second, which reads like something changed.
     std::fputs(kStoreFormat, f);
     std::fprintf(f, "# story %zu\n", g_story_functions);
+    std::fprintf(f, "# typeat %lx\n", (unsigned long)type_offset());
     // The type aliases, which decide whether a stored value is a string.
     // Scanning for the engine's table costs a pass over every writable
     // mapping, so once is enough per story.
@@ -1892,16 +1990,19 @@ std::size_t load_out_param_counts(std::vector<Function>* functions,
     find_database_db(base);
     find_string_table();
 
+    g_cache_story = story != nullptr ? story : "";
     std::size_t fromStore = 0;
     if (load_cached_signatures(story, functions, &fromStore)) {
         if (cached != nullptr) *cached = true;
         // The cache carries the aliases too; only fall back to searching
         // for the engine's table if it did not.
         learn_aliases();
+        read_story_header_types();
         return fromStore;
     }
 
     learn_aliases();
+    read_story_header_types();
 
     std::uintptr_t holder = 0;
     if (!peek(base + function_db_holder(), &holder) || holder < 0x1000) {
@@ -2843,6 +2944,47 @@ DbEntry const* user_query_entry(char const* name, std::size_t inputs,
 
 }  // namespace
 
+std::vector<Signature> signatures(char const* name) {
+    std::vector<Signature> out;
+    const CacheLock lock(osiris_cache_lock());
+    if (name == nullptr || !bind_defs() || type_offset() == 0) return out;
+    const std::string prefix = std::string(name) + "/";
+    for (auto const& entry : database()) {
+        if (entry.first.compare(0, prefix.size(), prefix) != 0 || entry.second.Def == 0) continue;
+        std::uint32_t type = 0;
+        std::uint32_t handle = 0;
+        if (!read_type_and_handle(entry.second.Def, type_offset(), &type, &handle)) continue;
+        Signature sig;
+        sig.arity = (std::uint32_t)entry.second.Types.size();
+        sig.type = type;
+        sig.inputs = sig.arity - (std::uint32_t)std::max(entry.second.Outs, 0);
+        out.push_back(sig);
+    }
+    std::sort(out.begin(), out.end(),
+              [](Signature const& a, Signature const& b) { return a.arity < b.arity; });
+    return out;
+}
+
+bool declared_inputs(char const* name, std::size_t inputs, std::vector<std::uint16_t>* types) {
+    const CacheLock lock(osiris_cache_lock());
+    if (name == nullptr || !bind_defs()) return false;
+    const std::string prefix = std::string(name) + "/";
+    for (auto const& entry : database()) {
+        if (entry.first.compare(0, prefix.size(), prefix) != 0) continue;
+        const std::size_t arity = (std::size_t)std::strtoul(entry.first.c_str() + prefix.size(), nullptr, 10);
+        const std::size_t outs = (std::size_t)std::max(entry.second.Outs, 0);
+        if (outs > arity || arity - outs != inputs) continue;
+        types->clear();
+        const bool typed = entry.second.Types.size() == arity;
+        for (std::size_t i = 0; i < arity; ++i) {
+            if (i < 64 && ((entry.second.OutMask >> i) & 1) != 0) continue;
+            types->push_back(typed ? resolve_alias(entry.second.Types[i]) : 0);
+        }
+        return true;
+    }
+    return false;
+}
+
 Status query(char const* name, std::vector<Value> const& inputs,
              std::vector<Value>* outputs, std::string* why) {
     const CacheLock lock(osiris_cache_lock());
@@ -3168,33 +3310,48 @@ std::unordered_map<std::uint32_t, WatchedCall>& watched_calls() {
     return calls;
 }
 
+// A listener registers from either context's thread; the story thread reads.
+std::mutex& watched_lock() {
+    static std::mutex lock;
+    return lock;
+}
+
 std::atomic<bool> g_any_watched_call{false};
 
 }  // namespace
 
 bool watch_call(Function const& fn) {
-    if (fn.kind() != kCall || (fn.id >> 3) == 0) return false;
-    watched_calls()[fn.id] = WatchedCall{fn.name, fn.params};
+    // Builtin queries as well since upstream v33.
+    if ((fn.kind() != kCall && fn.kind() != kQuery) || (fn.id >> 3) == 0) return false;
+    {
+        const std::lock_guard<std::mutex> held(watched_lock());
+        watched_calls()[fn.id] = WatchedCall{fn.name, fn.params};
+    }
     g_any_watched_call.store(true, std::memory_order_release);
     return true;
 }
 
 bool call_watched(std::uint32_t id) {
-    return g_any_watched_call.load(std::memory_order_acquire)
-           && watched_calls().count(id) != 0;
+    if (!g_any_watched_call.load(std::memory_order_acquire)) return false;
+    const std::lock_guard<std::mutex> held(watched_lock());
+    return watched_calls().count(id) != 0;
 }
 
 void fire_call(std::uint32_t id, void const* args, char const* event) {
     if (g_trigger == nullptr) return;
-    auto found = watched_calls().find(id);
-    if (found == watched_calls().end()) return;
-    auto const& call = found->second;
+    WatchedCall call;
+    {
+        const std::lock_guard<std::mutex> held(watched_lock());
+        auto found = watched_calls().find(id);
+        if (found == watched_calls().end()) return;
+        call = found->second;
+    }
 
     std::vector<Value> values;
     void const* node = args;
     for (std::size_t i = 0; i < call.params.size() && node != nullptr; ++i) {
         const std::uint8_t declared = call.params[i];
-        values.push_back(read(node, declared >= 6 ? kGuidString : declared));
+        values.push_back(read_declared(node, declared));
         void const* next = nullptr;
         if (!peek((std::uintptr_t)node, &next)) break;
         node = next;
@@ -3361,8 +3518,9 @@ Status invoke(const Function& fn, const std::vector<Value>& inputs,
             write(storage[i], wire_type(declared, inputs[next]), inputs[next]);
             ++next;
         } else {
-            // An output: typed, value left cleared.
-            accessors().set_type(storage[i], declared >= 6 ? kGuidString : declared);
+            // An output: given its declared type, as upstream's query call
+            // does, value left cleared.
+            accessors().set_type(storage[i], declared);
         }
         void* nxt = (i + 1 < n) ? static_cast<void*>(storage[i + 1]) : nullptr;
         std::memcpy(storage[i], &nxt, sizeof(nxt));  // NextParam at +00
@@ -3378,7 +3536,7 @@ Status invoke(const Function& fn, const std::vector<Value>& inputs,
         for (std::size_t i = 0; i < n; ++i) {
             if (!fn.is_output(i, inputs.size())) continue;
             const std::uint8_t declared = fn.params[i];
-            outputs->push_back(read(storage[i], declared >= 6 ? kGuidString : declared));
+            outputs->push_back(read_declared(storage[i], declared));
         }
     }
     return Status::kHandled;

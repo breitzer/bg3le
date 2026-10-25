@@ -11,7 +11,7 @@ extender core and the code generators in this directory represent an enormous
 amount of reverse engineering. bg3le reuses them rather than rediscovering
 them, and would not be a realistic project otherwise.
 
-Upstream commit: `dc2530ab` (2026-09-23). Newer upstream commits are brought in
+Upstream commit: `af85fd2b`, tag `v33` (2026-10-12). Newer upstream commits are brought in
 by applying upstream's own diff over this tree, which keeps the changes listed
 below; regenerate the generated files afterwards.
 
@@ -459,6 +459,15 @@ client Lua state's `DeferredUIEvents`, which bg3le does not have. Under
 a callback and, when the value changes, hands the object and property name to
 `src/vendor/bg3le_noesis_lua.inl`, which delivers them on the client tick as
 upstream's `PostUpdate` does. Checked by `tools/check-vendor-patches.py`.
+
+**`Lua/Libs/ClientUI/CustomProperties.inl` — a wrapped DataContext property
+registers its base with bg3le.** `TypePropertyDataContextWrapped` forwards
+`Get`/`GetCopy` to the base property in the headers' slot order, but the
+engine's two Get overloads sit in the opposite slots, and some engine
+properties register no getter at all. The constructor hands bg3le the wrapper
+and its base, and `src/vendor/bg3le_noesis_lua.inl` reads such a property as
+the base on the wrapped object, through its slot-aware accessors. Checked by
+`tools/check-vendor-patches.py`.
 
 **`Extender/Client/IMGUI/Vulkan.inl` — the overlay is composited onto an
 HDR swapchain.** Upstream draws ImGui straight into the swapchain; when the

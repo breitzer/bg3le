@@ -180,4 +180,24 @@ Status insert(char const* key, std::vector<Value> const& args,
 Status invoke(const Function& fn, const std::vector<Value>& inputs,
               std::vector<Value>* outputs);
 
+// A story type's base type (1-5) from the story header's aliases; the type
+// itself while it is unknown.
+std::uint16_t resolve_alias(std::uint16_t type);
+
+// One declaration of a name, as upstream's OsirisNameCache registers it: its
+// arity, how many of those are inputs, and its FunctionType (1-8).
+struct Signature {
+    std::uint32_t arity = 0;
+    std::uint32_t inputs = 0;
+    std::uint32_t type = 0;
+};
+
+// Every declaration of name in Osiris' function database, by arity.
+std::vector<Signature> signatures(char const* name);
+
+// The base types (1-5) of the inputs of name's declaration that takes `inputs`
+// of them, in declared order; 0 for one the story header did not resolve.
+// False when no declaration takes that many.
+bool declared_inputs(char const* name, std::size_t inputs, std::vector<std::uint16_t>* types);
+
 }  // namespace bg3le::osi

@@ -22,6 +22,7 @@ extern "C" bool bg3le_scannable_region(char const* line,
                                        unsigned long long* from,
                                        unsigned long long* to);
 extern "C" std::size_t bg3le_noesis_resolve(void* (*find)(char const*));
+extern "C" void bg3le_ui_run_deferred();
 
 namespace bg3le {
 namespace {
@@ -67,11 +68,13 @@ void saw_view(void* view) {
 
 std::uint64_t update_hook(void* view, double time) {
     saw_view(view);
+    bg3le_ui_run_deferred();
     return g_update(view, time);
 }
 
 std::uint64_t update_thunk_hook(void* iview, double time) {
     saw_view(static_cast<char*>(iview) - kIViewOffset);
+    bg3le_ui_run_deferred();
     return g_update_thunk(iview, time);
 }
 
@@ -142,6 +145,8 @@ void noesis_set_symbols(const SymbolTable* symbols) {
                           reinterpret_cast<void*>(&update_thunk_hook), &g_update_thunk);
     if (!g_hooked) logf("noesis: View::Update not hooked; Ext.UI will scan for the View");
 }
+
+bool noesis_update_hooked() { return g_hooked; }
 
 void* noesis_view() {
     void* view = g_view.load();
