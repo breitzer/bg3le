@@ -8972,6 +8972,11 @@ local function walkable(v)
 end
 Ext._Internal.Walkable = walkable
 
+-- A view to fill in place: an enum or bitfield value iterates too, but is written whole.
+function Ext._Internal.Fillable(v)
+  return walkable(v) and Ext._Internal.BitfieldOf(v) == nil and Ext._Internal.EnumLabelOf(v) == nil
+end
+
 -- Ext.Json.Stringify, ported from upstream's Lua/Libs/Json.inl.
 --
 -- A plain table is walked raw: an array when its keys are exactly 1..n,
@@ -10174,7 +10179,7 @@ local function unserialize_into(object, values)
       local ok, value = pcall(function() return object[k] end)
       if ok then cur = value end
     end
-    if type(v) == "table" and Ext._Internal.Walkable(cur) then
+    if type(v) == "table" and Ext._Internal.Fillable(cur) then
       local okLen, n = false, nil
       if next(v) == nil or v[1] ~= nil then
         okLen, n = pcall(function() return #cur end)
@@ -10189,7 +10194,7 @@ local function unserialize_into(object, values)
       -- A new map key: its value went in whole, or failed, and either way
       -- its structs are filled in place.
       local added = type(v) == "table" and object[k] or nil
-      if Ext._Internal.Walkable(added) then
+      if Ext._Internal.Fillable(added) then
         unserialize_into(added, v)
       elseif not ok then
         error(err, 0)
@@ -10222,7 +10227,7 @@ function Ext._Internal.FillStructElements(view, list)
   for i, item in ipairs(list) do
     if type(item) == "table" then
       local element = view[i]
-      if Ext._Internal.Walkable(element) then Ext.Types.Unserialize(element, item) end
+      if Ext._Internal.Fillable(element) then Ext.Types.Unserialize(element, item) end
     end
   end
 end
