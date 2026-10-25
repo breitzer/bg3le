@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.3.15 (2026-10-25)
+
+- An optional enum field reads as its label and takes a label when written, as upstream's does.
+  `FeatRequirement.Ability`, an optional `AbilityId`, read back as a number, and writing `"Strength"` to it failed
+  with "number expected, got string". Path to Apotheosis' Epic Boon feat lock does that write from its `Tick`
+  handler, so it failed about four times a second for the whole session.
+- Writing a list of flag lists into a bitfield array works. Trials Ascension's
+  `Resistances.Resistances = { { "ImmuneToMagical", "ImmuneToNonMagical" }, ... }` wrote the array and then failed
+  with "attempt to index a ResistanceBoostFlags value": bg3le went on to fill each bitfield value as if it were a
+  struct. Enum and bitfield values are written whole, after an array write and in `Ext.Types.Unserialize`.
+
 ## v0.3.14 (2026-10-21)
 
 - Stats load in full on every launch. About one launch in three loaded only part of them, anywhere from 2,000 to
