@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Script Extender API v33. The vendored bg3se is upstream's v33, and what upstream changed in it is followed:
+  engine queries fire Osiris listeners, `Ext.Enums` entries are `EnumValue` objects, a `require` after a mod's
+  bootstrap raises, and argument errors read as upstream's and name the mod's line. The README lists what still
+  differs.
+- HomeBrew - Comprehensive Reworks runs: its difficulty menus, ability base values, spell filters, equipment
+  preview and appearance presets all work. bg3le gained Noesis collection writes, `TypeInfo()`, the widget fields,
+  `Ext.UI.Defer`, `Ext.IO.FindFiles` and Osiris enum out-params, all of which it uses.
+- Assigning a whole component or struct copies it in place, as upstream's does, so what a table cannot carry, such
+  as an animation variable's type, is kept.
+- `GenomeVariant`, `Version` and `EntityOrVec3` fields can be written, and component arrays can shrink and grow.
+
 ## v0.3.15 (2026-10-25)
 
 - An optional enum field reads as its label and takes a label when written, as upstream's does.

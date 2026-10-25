@@ -123,12 +123,8 @@ history since, and the README has the current summary.
   story's own call does
 - **`Ext.Enums`**, every enum and bitfield bg3se describes, reachable by label
   or by numeric value, under the Lua name the generated metadata gives it —
-  `Ext.Enums.ClientGameState.Menu`, not `ecl::GameState`. The entries are the
-  labels rather than upstream's `EnumValue` objects, deliberately: bg3le reads
-  an enum-typed field as its label, which is what `reference/` verifies
-  against the real extender, and a comparison is what a mod does with these.
-  Two strings compare equal; a proxy against a string never would, since
-  Lua's `__eq` does not fire across types
+  `Ext.Enums.ClientGameState.Menu`, not `ecl::GameState`. The entries are
+  `EnumValue` objects, as upstream's are, and compare equal to their label
 - **`Ext.Net` crosses between the two contexts.** Upstream's messages ride
   the game's connection as protobuf because on Windows the two sides may be
   two machines; single-player is one process either way, and bg3le has both

@@ -27,8 +27,9 @@ component's declared size with the size the engine recorded, and
 
 ## What works
 
-bg3le implements the public `Ext` API of bg3se on the native build: every
-function upstream registers is present in both contexts
+bg3le implements the public `Ext` API of bg3se, at its API version 33, on
+the native build: every function upstream registers is present in both
+contexts
 (`tools/check-api.sh`, against upstream's own module declarations), and
 `tools/count-refusals.py` finds none that refuse.
 It is checked against output captured from the Windows extender
@@ -105,9 +106,16 @@ structure was found, and what was measured, is in
 - Multiplayer has been tested over the game's own loopback (single player
   with `Ext._Internal.NetForceRemote(true)`), not yet against a second
   machine or a Windows player running bg3se. Reports welcome.
-- Two deliberate differences: a `require` after a mod has finished loading
-  still works (upstream errors), and `Ext.Enums` entries are labels rather
-  than `EnumValue` objects.
+- Where bg3le still differs from v33:
+  - `Ext.Stats.Get` returns a table with a metatable, so `type()` says
+    `table` where upstream's says `userdata`.
+  - A `GenomeVariant` with no type yet, such as one a resize appends, cannot
+    be given a value: upstream looks the type up in an engine registry
+    bg3le has not found. Typed ones read and write as upstream's do.
+  - A set of structs can be assigned only the contents it already has, since
+    bg3le cannot hash every key type to rebuild one.
+  - One-frame component events are watched as upstream watches them, but the
+    engine raised none in testing, so their delivery is unverified.
 
 ## Building
 
