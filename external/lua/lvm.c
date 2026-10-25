@@ -31,6 +31,20 @@
 #include "lvm.h"
 
 
+/*
+** bg3le: a tail call from other code into bg3le's own Lua (a "=bg3le..."
+** chunk, standing in for one of upstream's C functions) keeps the caller's
+** frame, as a call to a C function does, so an error can name the caller's line.
+*/
+static int bg3le_internalproto (Proto *p) {
+  return p->source != NULL && strncmp(getstr(p->source), "=bg3le", 6) == 0;
+}
+
+static int bg3le_keepscaller (Proto *caller, Proto *callee) {
+  return bg3le_internalproto(callee) && !bg3le_internalproto(caller);
+}
+
+
 /* limit for table tag-method chains (to avoid loops) */
 #define MAXTAGLOOP	2000
 
@@ -1188,6 +1202,10 @@ void luaV_execute (lua_State *L) {
         lua_assert(GETARG_C(i) - 1 == LUA_MULTRET);
         if (luaD_precall(L, ra, LUA_MULTRET)) {  /* C function? */
           Protect((void)0);  /* update 'base' */
+        }
+        else if (bg3le_keepscaller(cl->p, getproto(L->ci->func))) {
+          ci = L->ci;  /* an ordinary call; the OP_RETURN after it returns its results */
+          goto newframe;
         }
         else {
           /* tail call: put called frame (n) in place of caller one (o) */

@@ -27,6 +27,16 @@ since bg3le does not use the cppobject machinery for its own objects):
   luaH_bg3leenumlabel (declared in ltable.h) is what recognises one: a full
   userdata whose metatable holds __bg3leEnumLabel.
 
+One for error positions:
+
+- lauxlib.c, luaL_where: frames of bg3le's own chunks (named "=bg3le...")
+  are skipped, with any C function between two of them, so luaL_error and
+  error(msg, n) point at the mod's code -- where upstream's C functions,
+  which bg3le implements in Lua, put them.
+- lvm.c, OP_TAILCALL: a tail call from a mod into one of those chunks runs
+  as an ordinary call, keeping the mod's frame the way a C callee would, so
+  `return Ext.Foo()` still has a line for the error to name.
+
 And one for mods written on Windows:
 
 - luaconf.h, lua_pointer2str: pointers print as MSVC prints %p, sixteen

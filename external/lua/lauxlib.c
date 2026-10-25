@@ -215,8 +215,24 @@ static void tag_error (lua_State *L, int arg, int tag) {
 ** The use of 'lua_pushfstring' ensures this function does not
 ** need reserved stack space when called.
 */
+/* bg3le: whether the frame at level runs one of bg3le's own chunks */
+static int bg3le_internal (lua_State *L, int level) {
+  lua_Debug ar;
+  if (!lua_getstack(L, level, &ar)) return 0;
+  lua_getinfo(L, "S", &ar);
+  return strncmp(ar.source, "=bg3le", 6) == 0;
+}
+
 LUALIB_API void luaL_where (lua_State *L, int level) {
   lua_Debug ar;
+  /* bg3le: its Lua stands in for upstream's C functions, so a position skips
+  ** past it, and past a C function it called (a pcall), to the caller. */
+  for (;;) {
+    if (bg3le_internal(L, level)) { level++; continue; }
+    if (bg3le_internal(L, level + 1) && lua_getstack(L, level, &ar)
+        && lua_getinfo(L, "S", &ar) && strcmp(ar.what, "C") == 0) { level++; continue; }
+    break;
+  }
   if (lua_getstack(L, level, &ar)) {  /* check function at level */
     lua_getinfo(L, "Sl", &ar);  /* get info about it */
     if (ar.currentline > 0) {  /* is there info? */
