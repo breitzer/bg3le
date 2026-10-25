@@ -3472,6 +3472,16 @@ extern "C" bool bg3le_meta_bitflag(void const* handle, char const* name,
     return true;
 }
 
+// The descriptor naming a field's enum: the field's own, or an optional's payload.
+static FieldDesc const* enum_desc(FieldDesc const& field) {
+    if (field.TypeName != nullptr) return &field;
+    if (field.Kind == FieldKind::Optional && field.ElemDesc != nullptr
+        && field.ElemDesc->TypeName != nullptr) {
+        return field.ElemDesc;
+    }
+    return nullptr;
+}
+
 extern "C" bool bg3le_meta_enum_label(void const* handle, char const* path,
                                       std::size_t index, char const** label,
                                       std::uint64_t* value, bool* isBitmask) {
@@ -3480,10 +3490,11 @@ extern "C" bool bg3le_meta_enum_label(void const* handle, char const* path,
 
     const auto r = resolve_path(static_cast<ClassFields const*>(handle), path,
                                 nullptr);
-    if (!r.Ok || r.Field.TypeName == nullptr) return false;
+    FieldDesc const* desc = r.Ok ? enum_desc(r.Field) : nullptr;
+    if (desc == nullptr) return false;
 
     auto it = by_enum_name().find(
-        std::string_view(r.Field.TypeName, r.Field.TypeNameLength));
+        std::string_view(desc->TypeName, desc->TypeNameLength));
     if (it == by_enum_name().end()) return false;
 
     *isBitmask = it->second->IsBitmask;
@@ -3552,8 +3563,9 @@ extern "C" char const* bg3le_meta_kind_name(std::uint8_t kind) {
 extern "C" char const* bg3le_meta_enum_lua_name(void const* handle, char const* path) {
     if (handle == nullptr || path == nullptr) return nullptr;
     const auto r = resolve_path(static_cast<ClassFields const*>(handle), path, nullptr);
-    if (!r.Ok || r.Field.TypeName == nullptr) return nullptr;
-    auto it = by_enum_name().find(std::string_view(r.Field.TypeName, r.Field.TypeNameLength));
+    FieldDesc const* desc = r.Ok ? enum_desc(r.Field) : nullptr;
+    if (desc == nullptr) return nullptr;
+    auto it = by_enum_name().find(std::string_view(desc->TypeName, desc->TypeNameLength));
     if (it == by_enum_name().end()) return nullptr;
     return it->second->LuaName != nullptr ? it->second->LuaName : it->second->Name;
 }

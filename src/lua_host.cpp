@@ -2325,6 +2325,13 @@ bool read_optional(lua_State* L, void const* meta, char const* path,
         lua_pushnil(L);
         return true;
     }
+    // An optional enum reads as its label, as upstream pushes it.
+    const std::size_t width = field_kind_size((FieldKind)kind);
+    std::uint64_t raw = 0;
+    if (width != 0 && width <= 8 && safe_read(payload, &raw, width)
+        && push_enum(L, meta, path, raw)) {
+        return true;
+    }
     if (!push_field(L, payload, (FieldKind)kind, (FieldKind)elemKind,
                     elemCount)) {
         lua_pushnil(L);
@@ -2447,6 +2454,8 @@ bool write_optional(lua_State* L, int index, void const* meta,
     }
     if (payload == nullptr) return false;
 
+    // An optional enum takes a label, as a plain enum field does.
+    enum_arg_in_place(L, index, meta, path);
     return write_field(L, index, payload, (FieldKind)kind,
                        (FieldKind)elemKind, elemCount);
 }
