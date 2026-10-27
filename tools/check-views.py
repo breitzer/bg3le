@@ -62,6 +62,18 @@ encoder = slice_between(
     "-- A JSON string literal.",
     "function Ext.DumpExport(v)")
 
+# PlainValue and FillInto, which the views' writes go through; over plain
+# tables both return before touching any internal.
+plain_value = slice_between(
+    "-- A container or struct proxy as the plain table upstream copies it from",
+    "make_fields = function(handle, comp, prefix, fields, identity)")
+
+# Stringify raises again through these; the harness's errors are positioned in
+# its own file, so they end at error(err, 0) and never reach RaiseOutside.
+reraise = slice_between(
+    "-- An error caught inside the prelude, raised again for the caller",
+    "-- A refused write, as upstream's")
+
 PRELUDE = """
 local fails = 0
 local function check(what, got, want)
@@ -79,6 +91,18 @@ Ext = {_Internal = {}, Types = {}}
 function Ext._Internal.NewObjectProxy(meta) return setmetatable({}, meta) end
 function Ext._Internal.IsVector() return false end
 function Ext._Internal.EntityProxyHandle() return nil end
+Ext._Internal.RawGetMetatable = debug.getmetatable  -- as the prelude sets it
+function Ext._Internal.IsHashSet() return false end  -- nothing here is a set
+-- The C one reads the table's layout: no hash keys and no holes. From Lua, keys
+-- 1..n and nothing else.
+function Ext._Internal.TableIsLinearArray(t)
+  local n = 0
+  for _ in pairs(t) do n = n + 1 end
+  for i = 1, n do
+    if rawget(t, i) == nil then return false end
+  end
+  return true
+end
 function Ext.Types.GetValueType(v) return type(v) end
 local make_fields
 local make_map
@@ -149,11 +173,23 @@ check("pairs count", seen, 7)
 check("pairs last index", last, 7)
 
 -- A read out of range is nil, as upstream's ArrayProxy answers, which is
--- also what stops ipairs; a write out of range still raises.
+-- also what stops ipairs. A write below the start is ignored, as upstream's
+-- SetElement refuses it and NewIndex drops that; a[#a + 1] appends, which
+-- needs the engine.
 for _, bad in ipairs({0, 8, -1}) do
   check("read a[" .. bad .. "] is nil", a[bad], nil)
-  check("write a[" .. bad .. "] raises",
-        pcall(function() a[bad] = 1 end), false)
+end
+local function snapshot()
+  local s = {}
+  for k, v in pairs(store) do s[#s + 1] = k .. "=" .. tostring(v) end
+  table.sort(s)
+  return table.concat(s, ",")
+end
+for _, bad in ipairs({0, -1}) do
+  local before = snapshot()
+  check("write a[" .. bad .. "] is ignored",
+        pcall(function() a[bad] = 1 end), true)
+  check("store unchanged by a[" .. bad .. "]", snapshot(), before)
 end
 check("write a.nope raises", pcall(function() a.nope = 1 end), false)
 
@@ -334,8 +370,9 @@ check("a control character is escaped as JSON",
       control:find("\\u0001", 1, true) ~= nil, true)
 check("a control character is not escaped as Lua",
       control:find("\\1x", 1, true) == nil, true)
+-- Upper-case hex, as upstream's writer (rapidjson) puts it.
 check("the high control character too",
-      control:find("\\u001f", 1, true) ~= nil, true)
+      control:find("\\u001F", 1, true) ~= nil, true)
 
 local quoted = Ext.Json.Stringify({k = "a\"b\\c\nd\te"})
 check("a quote is escaped", quoted:find('\\"', 1, true) ~= nil, true)
@@ -400,7 +437,7 @@ end
 print("array, map, dump and nested containers all check out")
 """
 
-harness = (PRELUDE + make_array + make_map + "Ext.Json = {}\n" + encoder
+harness = (PRELUDE + plain_value + reraise + make_array + make_map + "Ext.Json = {}\n" + encoder
            + ARRAY_TEST + MAP_TEST + DUMP_TEST + NESTED_TEST)
 
 with tempfile.NamedTemporaryFile("w", suffix=".lua", delete=False) as f:
