@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.0-beta1 (2026-10-27)
 
 - Script Extender API v33. The vendored bg3se is upstream's v33, and what upstream changed in it is followed:
   engine queries fire Osiris listeners, `Ext.Enums` entries are `EnumValue` objects, a `require` after a mod's
