@@ -1993,7 +1993,11 @@ const ImWchar* GetGlyphRangesTurkish()
 bool IMGUIManager::LoadFont(FontData& request)
 {
     auto path = request.Path;
-    auto glyphRanges = ImGui::GetIO().Fonts->GetGlyphRangesDefault();
+    // BG3LE native Linux: the overlay can start before the game's real
+    // language is available. Keep Cyrillic glyphs even when the temporary
+    // GlobalSwitches fallback reports English. This range includes Latin.
+    // The language-specific CJK branches below still override this range.
+    auto glyphRanges = ImGui::GetIO().Fonts->GetGlyphRangesCyrillic();
     if (path.empty()) {
         auto const& language = GetStaticSymbols().GetGlobalSwitches()->Language;
         if (language == "Korean") {
